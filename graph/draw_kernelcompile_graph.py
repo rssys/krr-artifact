@@ -24,7 +24,7 @@ HEIGHT = 2.6
 WIDTH = 4
 
 def draw_graph():
-    time_df_filepath = osp.join(RAW_DATA_DIR, "kernel_build-kernel_build-time-defconfig.csv")
+    time_df_filepath = osp.join(RAW_DATA_DIR, "kernel_build-kernel_build-time.csv")
     rawdata_df = pandas.read_csv(time_df_filepath)
 
     timetaken_data_df = pandas.DataFrame({"cores": [], "mode": [], "value": []})

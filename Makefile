@@ -20,7 +20,7 @@ build/client:
 	bash scripts/setup_client.sh
 
 run/kernel_build: test_data
-	bash scripts/kernel_benchmark.sh $(CURRENT_DIR) kbuild
+	bash scripts/kernel_benchmark.sh $(CURRENT_DIR) kernel_build $(schemes)
 
 run/rocksdb: test_data
 	bash scripts/rocksdb_benchmark.sh $(CURRENT_DIR) rocksdb $(schemes)

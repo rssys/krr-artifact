@@ -1,58 +1,16 @@
 # KRR (Kernel RR)
 
-KRR is record-replay tool targeting Linux kernel and it's implemented based on QEMU(7.0.0) & KVM (5.17.5) tool, compared with other record-replay tools, KRR supports recording with hardware-assisted virtualization (KVM) and multi-core.
+All you need:
+* KRR's kernel image and its vmlinux
+* A rootfs disk image
 
-## Hardware Requirement
-KRR only supports Intel processor now.
-
-## Record
-
-### Install KRR KVM
-1. Download the KRR's KVM hypervisor source code linux:
-```
-git clone -b rr-para https://github.com/tianrenz2/kernel-rr-linux.git
-```
-
-2. Generate the .config file:
-```
-cp kernel_rr_config .config
-```
-
-3. Compile:
-```
-make -j16
-make modules_install
-make install
-```
-
-4. Reboot machine to use the KRR KVM.
-
-
-### Compile KRR QEMU
-1. First, go to kernel RR QEMU code, the latest release could be obtained [here](https://drive.google.com/file/d/19dFibkU_ltCtldfFtIwOiVcGVylptlPf/view?usp=drive_link):
-```
-cd qemu-tcg-kvm
-```
-
-2. Compile:
-```
-mkdir build
-cd build
-../configure --target-list=x86_64-softmmu
-make -j$(nproc)
-```
-
-3. Get the kernel you want to test, here is a prepared [Linux kernel image](https://drive.google.com/file/d/1cO0qMsqkReSKdHDZ1XC8r3-lT-ixJqfW/view?usp=drive_link) & [vmlinux](https://drive.google.com/file/d/1ZgOJHexDfFAvf2TX9EFhv_Fn_DBsb3oe/view?usp=drive_link) based on 6.1.0([source code](https://github.com/tianrenz2/linux-6.1.0/tree/smp-rr)), if you want to build on your own, here is a [guide](#make-your-own-recordable-kernel) to help compile your recordable guest kernel image.
-
-4. Get the root disk image you want to boot, [here](https://github.com/google/syzkaller/blob/master/tools/create-image.sh) is a script from syzkaller that helps you create a simple rootfs image.
-
-5. Launch the guest, for the guest below, it takes 2GB for the guest RAM, additionally, it also takes 4GB for the event trace as the recording needs, so make sure you have this much memory on your machine:
+1. Launch the guest, in the example below, it takes 2GB for the guest RAM, additionally, it also takes 4GB for the event trace, so make sure you have enough memory on your machine:
 ```
 cd qemu-tcg-kvm/build
 ../build/qemu-system-x86_64 -smp 1 -kernel <your kernel image> -accel kvm -cpu host -no-hpet -m 2G -append  "root=/dev/sda rw init=/lib/systemd/systemd tsc=reliable console=ttyS0" -hda <your root disk image> -object memory-backend-file,size=4096M,share,mem-path=/dev/shm/ivshmem,id=hostmem -device ivshmem-plain,memdev=hostmem -nographic
 ```
 
-6. After getting into the system, click `ctrl+A` and `C` to enter the QEMU monitor command, and enter:
+2. After getting into the system, click `ctrl+A` and `C` to enter the QEMU monitor command, and enter:
 ```
 rr_record test1
 ```
@@ -70,9 +28,9 @@ Reset dma sg buffer
 Initial queue header enabled=1
 ```
 
-7. Execute things you want to record;
+3. Execute things you want to record;
 
-8. To finish the record session, get into the QEMU monitor command again, and enter:
+4. To finish the record session, get into the QEMU monitor command again, and enter:
 ```
 rr_end_record
 ```
@@ -108,13 +66,19 @@ Total dma buf cnt 107 size 442368
 network entry number 0, total net buf 0
 ```
 
-9. After finishing the record session, you get the files below, which are necessary to get it replayed:
+5. After finishing the record session, you get the files below, which are necessary to get it replayed:
 ```
 kernel_rr.log: stores the event trace.
 kernel_rr_dma-<number>.log: stores the disk DMA data, <number> refers to the device id.
 kernel_rr_network.log: stores the network data.
 test1: initial snapshot file of your system, its name is the same as the record session name you give in step 6.
 ```
+
+### Important to Notice
+* KRR has not yet supported multiple VMs being recorded at the same time yet (one of TODOs).
+* If a record session is interrupted without "rr_end_record", then next time launching the VM would be likely to directly crash, as KRR currently has not supported such automatically recovery case. The way to workaround this is to reload the KRR KVM module: go to kernel-rr-linux, then `sh replace.sh`.
+* KRR has not yet supported multiple recording sessions on one single VM's runtime, so when finish recording, if you want to record again, you need to launch a new QEMU process.
+
 
 ## Replay
 Using KRR for replay doesn't need KVM's support since it's purely userspace (QEMU TCG), what you need is just an initial snapshot and event trace.
@@ -128,17 +92,20 @@ First, make sure you have these 4 files under your `build` directory from last s
 - kernel_rr_dma-`<number>`.log: Disk DMA data;
 - kernel_rr_network.log: Network data.
 
-You also need the original disk image file you used for record, it's not going to be actually read in replay, it's just for consistent hardware configuration between record and replay.
-
+You also need the original disk image file you used for record, it's not going to be actually read in replay, just for consistent hardware configuration between record and replay.
 
 2. Generate kernel symbols:
+When using a different kernel image for replay, make sure to generate the kernel symbols and re-compile QEMU:
 ```
-cd qemu-tcg-kvm/kernel_rr
-bash generate_symbol.sh <absolute path to your vmlinux> <absolute path of your KRR QEMU directory>
+cd qemu-tcg-kvm/build
+bash ../kernel_rr/generate_symbol.sh <absolute path to your vmlinux> <absolute path of your KRR QEMU directory>
+
+# Recompile QEMU
+make -j$(nproc)
 ```
 KRR replayer needs some kernel symbol information to trap certain kernel code.
 
-After executing, it has the output below:
+Symbol generation has the output below:
 ```
 [root@tianren kernel_rr]# bash generate_symbol.sh /home/projects/linux-6.1.0/vmlinux /home/projects/qemu-tcg-kvm/
 GNU gdb (GDB) Fedora 12.1-2.fc36
@@ -161,13 +128,7 @@ Reading symbols from /home/projects/linux-6.1.0/vmlinux...
 Symbol generation finished, please recompile the KRR QEMU
 ```
 
-3. After generating the symbols, recompile the KRR QEMU:
-```
-cd qemu-tcg-kvm/build/
-make -j
-```
-
-4. Start replay:
+3. Start replay:
 In summary, the replay QEMU arguments are almost the same as the arguments for the record, except the following:
 ```
 -accel tcg  // Change from kvm to tcg
@@ -240,42 +201,11 @@ This will connect to the gdb-server.
 4. Then you can just use gdb commands just like debugging a regular program.
 
 ### Log out instructions
-Using following parameter could log out instructions & associated registers from N1th to N2th instruction.
+Using following parameter could log out instructions & associated registers from N1th to N2th instruction on CPU0.
 ```
--replay-log-bound start=N1,end=N2
+-replay-log-bound cpu=0,start=N1,end=N2
 ```
 The log file is specified by `-D logfile`.
-
-
-### Reverse Debugging
-KRR's replay also supports reverse debugging using gdb, the mechanism is based on snapshotting(similar to QEMU's native record & replay). So to really enable the reverse debugging, you firstly need to be able to replay successfully the target execution, during the replay, periodic snapshots need to be taken, repay it with the following command:
-```
-../build/qemu-system-x86_64 -accel tcg -smp 1 -cpu Broadwell -no-hpet -m 2G -hda <disk image> -device ivshmem-plain,memdev=hostmem -object memory-backend-file,size=4096M,share,mem-path=/dev/shm/ivshmem,id=hostmem -kernel-replay test1 -singlestep -D rec.log -snapshot-period 100000
-```
-Note that at the end we added `-snapshot-period 100000` parameter, which means a snapshot is taken on every 100000 instructions. After the snapshots are taken, you have the "checkpoints" for the execution to travel back.
-
-Then run the replay again with gdb console and remove the parameter `-snapshot-period 100000`, you can make use of the reverse debugging, for example, in gdb I hit the following breakpoint and want to reverse back by 1 instruction, execute reverse-stepi:
-```
-Breakpoint 2, do_syscall_64 (regs=0xffffc90000273f58, nr=1) at arch/x86/entry/common.c:75
-75		rr_handle_syscall(regs);
-(gdb) reverse-stepi
-```
-
-The replayer would have the following output indicating the latest snapshot is restored:
-```
-restoring snapshot 1
-loading snapshot
-... done.
-Found node with id 1
-[CPU-0]Restored snapshot, event number=110, CPU inst=100000
-```
-And continue to replay until one instruction before my last breakpoint:
-```
-(gdb) reverse-stepi
-entry_SYSCALL_64 () at arch/x86/entry/entry_64.S:120
-120		call	do_syscall_64		/* returns with IRQs disabled */
-(gdb)
-```
 
 ## Use NVMe device
 KRR also supports recording with emulated NVMe disk, add the following arguments:
@@ -291,14 +221,13 @@ Full command:
 ```
 
 ## Make your own recordable kernel
-Due to its split-recorder design, KRR requires some modifications to the guest linux kernel. The full changes refers to this [repo](https://github.com/tianrenz2/linux-6.1.0/tree/smp-rr), but here is a single [patch file](kernel_rr/Support-for-KRR-guest-recorder-patch) that contains all the changes. To apply the changes, mv the file to your kernel source code directory and execute:
+Due to its split-recorder design, KRR requires some modifications to the guest linux kernel. The full changes refers to this [repo](https://github.com/tianrenz2/linux-6.1.0/tree/smp-rr), but here is a single [patch file](0001-Support-KRR-guest-agent.patch) that contains all the changes. To apply the changes, mv the file to your kernel source code directory and execute:
 ```
-mv Support-for-KRR-guest-recorder-patch Support-for-KRR-guest-recorder.patch
-git apply Support-for-KRR-guest-recorder-patch
+git apply 0001-Support-KRR-guest-agent.patch
 ```
-Note that this patch file is based on Linux 6.1.0, different version of source code may encounter some conflicts to resolve.
+***Tips: this patch file is based on Linux 6.1.0, there might be conflicts when the kernel version is too far (e.g., 5.1.x), use the --reject option to show the conflicting files and try to resolve***
 
-To compile, we can refer to a sample [.config](kernel_rr/rr_guest_config) file, note that this config file is also based on linux 6.1.0, so depending on your own linux kernel version, it might be somehow different.
+To compile, we can refer to a sample [.config](rr_guest_config) file, note that this config file is also based on linux 6.1.0, so depending on your own linux kernel version, it might be somehow different.
 
 
 ## KRR Development Guide

@@ -2,7 +2,8 @@
 
 basedir=${1}
 test=${2}
-schemes=${3}
+schemes=${3:-"baseline,kernel_rr,whole_system_rr"}
+
 CUR_DIR=$(pwd)
 QEMU_DIR="qemu-tcg-kvm"
 RES_DIR="$test-data"
@@ -15,7 +16,6 @@ echo "Cleaned data in ${QEMU_DIR}/kernel_rr/test_data ${RES_DIR}"
 
 cd ${QEMU_DIR}/kernel_rr
 
-schemes_arg="baseline,kernel_rr,whole_system_rr"
 # Convert comma-separated schemes argument to an array
 IFS=',' read -r -a schemes <<< "$schemes_arg"
 

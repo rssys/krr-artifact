@@ -40,6 +40,9 @@ gzip -d rootfs-bypass.qcow2.gz
 gdown --id 1USs8dY4O22Xxm_LuxBJYvn7Y6zunVbQa # dpdk disk image
 gzip -d rootfs-redis.qcow2.gz
 
+gdown --id 1I3-4OxfwQv33VxfFWvW1ZSWdGxq6llhU # kernel-build image
+gzip -d rootfs-kbuild.qcow2.gz
+
 gdown --id 1cO0qMsqkReSKdHDZ1XC8r3-lT-ixJqfW # KRR image
 gdown --id 1q5MEQ1g7dSJAQQlV7hrMFv9ff6DHVWhN # Native image
 gdown --id 1ZgOJHexDfFAvf2TX9EFhv_Fn_DBsb3oe # vmlinux RR
