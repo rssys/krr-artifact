@@ -2,7 +2,7 @@
 
 basedir=${1}
 test=${2}
-schemes=${3:-"baseline,kernel_rr,whole_system_rr"}
+schemes_arg=${3:-"baseline,kernel_rr,whole_system_rr"}
 
 CUR_DIR=$(pwd)
 QEMU_DIR="qemu-tcg-kvm"

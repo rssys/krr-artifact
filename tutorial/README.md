@@ -10,7 +10,7 @@ cd qemu-tcg-kvm/build
 ../build/qemu-system-x86_64 -smp 1 -kernel <your kernel image> -accel kvm -cpu host -no-hpet -m 2G -append  "root=/dev/sda rw init=/lib/systemd/systemd tsc=reliable console=ttyS0" -hda <your root disk image> -object memory-backend-file,size=4096M,share,mem-path=/dev/shm/ivshmem,id=hostmem -device ivshmem-plain,memdev=hostmem -nographic
 ```
 
-2. After getting into the system, click `ctrl+A` and `C` to enter the QEMU monitor command, and enter:
+2. After getting into the system, press `ctrl+A` and `C` to enter the QEMU monitor command, and enter:
 ```
 rr_record test1
 ```
@@ -99,9 +99,6 @@ When using a different kernel image for replay, make sure to generate the kernel
 ```
 cd qemu-tcg-kvm/build
 bash ../kernel_rr/generate_symbol.sh <absolute path to your vmlinux> <absolute path of your KRR QEMU directory>
-
-# Recompile QEMU
-make -j$(nproc)
 ```
 KRR replayer needs some kernel symbol information to trap certain kernel code.
 
@@ -151,10 +148,10 @@ If your record arguments are like below:
 
 Then the corresponding replay argument:
 ```
-../build/qemu-system-x86_64 -accel tcg -smp 1 -cpu Broadwell -no-hpet -m 2G -kernel <your kernel image> -append  "root=/dev/sda rw init=/lib/systemd/systemd tsc=reliable console=ttyS0" -hda <your root disk image> -device ivshmem-plain,memdev=hostmem -object memory-backend-file,size=4096M,share,mem-path=/dev/shm/ivshmem,id=hostmem -kernel-replay test1 -singlestep -D rec.log -monitor stdio
+../build/qemu-system-x86_64 -accel tcg -smp 1 -cpu Broadwell -no-hpet -m 2G -kernel <your kernel image> -append  "root=/dev/sda rw init=/lib/systemd/systemd tsc=reliable console=ttyS0" -hda <your root disk image> -device ivshmem-plain,memdev=hostmem -object memory-backend-file,size=4096M,share,mem-path=/dev/shm/ivshmem,id=hostmem -kernel-replay test1 -singlestep -D rec.log -nographic
 ```
 
-After launched, it stays paused and input `cont` command to start the replay execution:
+After launched, it stays paused, enter QEMU monitor command `cont` to start the replay execution:
 ```
 In replay mode, execute 'cont' to start the replay
 

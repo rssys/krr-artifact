@@ -35,7 +35,7 @@ run/redis_client:
 	bash scripts/redis_benchmark_client.sh $(CURRENT_DIR) $(host_ip) $(vm_ip)
 
 run/nginx_server:
-	bash scripts/redis_benchmark.sh $(CURRENT_DIR) nginx
+	bash scripts/nginx_benchmark.sh $(CURRENT_DIR) nginx
 
 run/nginx_client:
 	bash scripts/nginx_benchmark_client.sh $(CURRENT_DIR) $(host_ip) $(vm_ip)

@@ -11,7 +11,7 @@ python3 -m pip install pandas psutil qemu.qmp matplotlib seaborn gdown
 echo "Step1: compile KRR QEMU"
 gdown --id 19dFibkU_ltCtldfFtIwOiVcGVylptlPf
 tar -xf qemu-tcg-kvm.tar.gz
-cd qemu-tcg-kvm;mkdir -p build;cd build;../configure --target-list=x86_64-softmmu; make -j$(nproc);./qemu-img create nkbypass.img 5G;mkfs.ext4 nkbypass.img;./qemu-img create nvm.img 5G;cd ../..
+cd qemu-tcg-kvm;mkdir -p build;cd build;../configure --target-list=x86_64-softmmu; make -j$(nproc);cd ../..
 mkdir -p qemu-tcg-kvm/kernel_rr/test_data
 
 echo "Step2: compile KRR Kernel"
@@ -34,17 +34,11 @@ systemctl enable kernel-rr
 cp scripts/rr_set_cpu_aff /usr/bin/
 
 echo "Downloading disk and kernel image files"
-gdown --id 17LmtsNHwXui3NrP1CWFRM4VPrcEqs7FY # rocsdb disk image
-gzip -d rootfs-bypass.qcow2.gz
-
-gdown --id 1USs8dY4O22Xxm_LuxBJYvn7Y6zunVbQa # dpdk disk image
-gzip -d rootfs-redis.qcow2.gz
-
-gdown --id 1I3-4OxfwQv33VxfFWvW1ZSWdGxq6llhU # kernel-build image
-gzip -d rootfs-kbuild.qcow2.gz
-
 gdown --id 1cO0qMsqkReSKdHDZ1XC8r3-lT-ixJqfW # KRR image
 gdown --id 1q5MEQ1g7dSJAQQlV7hrMFv9ff6DHVWhN # Native image
 gdown --id 1ZgOJHexDfFAvf2TX9EFhv_Fn_DBsb3oe # vmlinux RR
+
+gdown --id "1NPurkLxeBkk8wu-Tx9Qgr62danBrvHNu" # rootfs image
+gzip -d rootfs-bug.qcow2.gz
 
 echo "Setup finished, please reboot your machine to launch KRR kernel"

@@ -1,4 +1,5 @@
 #/bin/bash
+add-apt-repository main
 apt-get install python3-pip jq wrk
 python3 -m pip install matplotlib seaborn gdown
 
