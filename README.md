@@ -3,8 +3,21 @@
 ***KRR*** is a record-replay (RR) tool for the operating system kernel, designed to achieve low recording overhead. Unlike existing RR systems that capture entire VM or user-space execution, KRR focuses on the kernel boundary, recording only the inputs that cross into the kernel space. This new approach significantly reduces recording overhead while maintaining accurate and reliable replay.
 
 For more details, please refer to our paper:
-> KRR: Efficient and Scalable Kernel Record Replay
-> Tianren Zhang, Sishuai Gong, Pedro Fonseca
+> KRR: Efficient and Scalable Kernel Record Replay.
+> Tianren Zhang, Sishuai Gong, Pedro Fonseca.
+> [OSDI'25](https://www.usenix.org/conference/osdi25/presentation/zhang-tianren).
+
+Citation:
+```
+@inproceedings{zhang:krr,
+  title = {{KRR}: Efficient and Scalable Kernel Record Replay},
+  author = {Tianren Zhang and Sishuai Gong and Pedro Fonseca},
+  booktitle={19th USENIX Symposium on Operating Systems Design and Implementation (OSDI)},
+  month = "Jul",
+  pages = {1--15},
+  year = {2025},
+}
+```
 
 ## Features
 Record:
