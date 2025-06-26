@@ -55,7 +55,7 @@ Get the artifact repo:
 git clone https://github.com/rssys/krr-artifact.git
 ```
 
-### Install KKR
+### Install KRR
 Go to the project directory, set up the environment with the following commands:
 ```
 make build
