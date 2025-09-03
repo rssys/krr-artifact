@@ -1,4 +1,4 @@
-From a9455de0273026d4a788f39d496b14d99a040cc9 Mon Sep 17 00:00:00 2001
+From 3e29373aa5f4707950b85aff92fdcdfeb638c73a Mon Sep 17 00:00:00 2001
 From: Silver Zhang <silvertianren@gmail.com>
 Date: Fri, 18 Apr 2025 22:36:08 -0400
 Subject: [PATCH] Support KRR guest agent
@@ -7,7 +7,7 @@ Subject: [PATCH] Support KRR guest agent
  arch/x86/entry/common.c              |   3 +
  arch/x86/entry/vdso/vclock_gettime.c |   2 +
  arch/x86/include/asm/archrandom.h    |   4 +
- arch/x86/include/asm/kernel_rr.h     | 166 +++++++
+ arch/x86/include/asm/kernel_rr.h     | 165 +++++++
  arch/x86/include/asm/msr.h           |  56 ++-
  arch/x86/include/asm/pgtable_64.h    |   4 +-
  arch/x86/include/asm/syscall.h       |   1 +
@@ -17,7 +17,7 @@ Subject: [PATCH] Support KRR guest agent
  arch/x86/kernel/Makefile             |   7 +
  arch/x86/kernel/kernel_rr.c          | 644 +++++++++++++++++++++++++++
  arch/x86/kernel/kvm_ivshmem.c        | 593 ++++++++++++++++++++++++
- arch/x86/kernel/rr_serialize.c       | 132 ++++++
+ arch/x86/kernel/rr_serialize.c       | 127 ++++++
  arch/x86/kernel/traps.c              |  17 +-
  arch/x86/mm/fault.c                  |   2 +
  drivers/char/random.c                |  12 +
@@ -39,7 +39,7 @@ Subject: [PATCH] Support KRR guest agent
  lib/strncpy_from_user.c              |   1 +
  mm/gup.c                             |   2 +-
  mm/memory.c                          |  15 +-
- 35 files changed, 1724 insertions(+), 24 deletions(-)
+ 35 files changed, 1718 insertions(+), 24 deletions(-)
  create mode 100644 arch/x86/include/asm/kernel_rr.h
  create mode 100644 arch/x86/kernel/kernel_rr.c
  create mode 100644 arch/x86/kernel/kvm_ivshmem.c
@@ -103,10 +103,10 @@ index 02bae8e07..6648311ff 100644
  
 diff --git a/arch/x86/include/asm/kernel_rr.h b/arch/x86/include/asm/kernel_rr.h
 new file mode 100644
-index 000000000..cf17d383d
+index 000000000..684e70811
 --- /dev/null
 +++ b/arch/x86/include/asm/kernel_rr.h
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,165 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +#ifndef _ASM_X86_KERNEL_RR_H
 +#define _ASM_X86_KERNEL_RR_H
@@ -252,7 +252,6 @@ index 000000000..cf17d383d
 +pte_t rr_read_pte(pte_t *pte);
 +pte_t rr_read_pte_once(pte_t *pte);
 +unsigned long *rr_rdtsc_begin(void);
-+int is_initialized(void);
 +
 +/* === io uring related functions === */
 +void rr_begin_record_io_uring(void);
@@ -496,16 +495,16 @@ index d13d71af5..52a6082e3 100644
  
  static __always_inline __must_check unsigned long
 diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
-index f901658d9..3243e5917 100644
+index f901658d9..a8c6fa3e5 100644
 --- a/arch/x86/kernel/Makefile
 +++ b/arch/x86/kernel/Makefile
 @@ -32,6 +32,10 @@ KCSAN_SANITIZE := n
  KMSAN_SANITIZE_head$(BITS).o				:= n
  KMSAN_SANITIZE_nmi.o					:= n
  
-+KASAN_SANITIZE_kernel_rr := n
-+KASAN_SANITIZE_rr_serialize := n
-+KASAN_SANITIZE_kvm_ivshmem := n
++KASAN_SANITIZE_kernel_rr.o := n
++KASAN_SANITIZE_rr_serialize.o := n
++KASAN_SANITIZE_kvm_ivshmem.o := n
 +
  # If instrumentation of this dir is enabled, boot hangs during first second.
  # Probably could be more selective here, but note that files related to irqs,
@@ -1771,10 +1770,10 @@ index 000000000..eb7793e3d
 +}
 diff --git a/arch/x86/kernel/rr_serialize.c b/arch/x86/kernel/rr_serialize.c
 new file mode 100644
-index 000000000..5381f8df8
+index 000000000..b51e210ce
 --- /dev/null
 +++ b/arch/x86/kernel/rr_serialize.c
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,127 @@
 +#include <linux/list.h>
 +#include <linux/spinlock.h>
 +#include <linux/kernel.h> // For printk
@@ -1901,11 +1900,6 @@ index 000000000..5381f8df8
 +
 +    preempt_enable();
 +    local_irq_restore(flags);
-+}
-+
-+int is_initialized(void)
-+{
-+    return initialized;
 +}
 diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
 index d3fdec706..5fbdf9585 100644
