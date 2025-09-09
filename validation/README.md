@@ -24,6 +24,8 @@ options:
   --record-timeout RECORD_TIMEOUT
                         Timeout for record waiting
 ```
+For rootfs image, you can use `rootfs-bug.qcow2` downloaded in the artifact [installation](../README.md#install-krr), this image includes all the test binaries.
+
 
 Example:
 ```
