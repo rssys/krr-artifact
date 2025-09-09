@@ -1,5 +1,8 @@
 # KRR Validation Test
 
+## Note
+Since we've done some updates to the code base, for this part, please use the newest version of KRR [QEMU](https://github.com/krr-io/krr-qemu)(the main branch), [KVM](https://github.com/krr-io/kernel-rr-linux)(the master branch) and the [guest agent patch](Support-KRR-guest-agent.patch) under this directory.
+
 Run testcases from LTP:
 ```
 python3 runtest.py --help

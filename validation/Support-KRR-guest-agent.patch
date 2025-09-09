@@ -1,0 +1,6962 @@
+From caf7d2321c4dc443d10f8cb60657ad1fbc4ce02b Mon Sep 17 00:00:00 2001
+From: Silver Zhang <silvertianren@gmail.com>
+Date: Sat, 6 Sep 2025 08:36:04 -0400
+Subject: [PATCH] Support KRR guest agent
+
+---
+ arch/x86/entry/common.c              |   3 +
+ arch/x86/entry/vdso/vclock_gettime.c |   2 +
+ arch/x86/include/asm/archrandom.h    |   4 +
+ arch/x86/include/asm/kernel_rr.h     | 166 +++++
+ arch/x86/include/asm/msr.h           |  56 +-
+ arch/x86/include/asm/pgtable_64.h    |   4 +-
+ arch/x86/include/asm/syscall.h       |   2 +
+ arch/x86/include/asm/traps.h         |   2 +
+ arch/x86/include/asm/uaccess.h       |   8 +
+ arch/x86/include/asm/uaccess_64.h    |  10 +-
+ arch/x86/kernel/Makefile             |   7 +
+ arch/x86/kernel/kernel_rr.c          | 760 +++++++++++++++++++++++
+ arch/x86/kernel/kvm_ivshmem.c        | 599 ++++++++++++++++++
+ arch/x86/kernel/rr_serialize.c       | 148 +++++
+ arch/x86/kernel/traps.c              |  17 +-
+ arch/x86/mm/fault.c                  |   2 +
+ fs/proc/task_mmu.c                   |  15 +-
+ igb_uio/Kbuild                       |   2 +
+ igb_uio/Makefile                     |   7 +
+ igb_uio/compat.h                     | 168 +++++
+ igb_uio/igb_uio.c                    | 668 ++++++++++++++++++++
+ igb_uio/meson.build                  |  20 +
+ include/asm-generic/qspinlock.h      |   3 +
+ include/linux/highmem-internal.h     |   8 +-
+ include/linux/kernel.h               |   3 +
+ include/linux/pgtable.h              |   2 +-
+ include/linux/uaccess.h              |  13 +
+ include/uapi/linux/kvm_para.h        |   2 +
+ init/main.c                          |   3 +
+ io_uring/io_uring.c                  |   2 +-
+ io_uring/io_uring.h                  |   4 +-
+ kernel/entry/common.c                |   3 +
+ kernel/sched/idle.c                  |   5 +
+ kernel/smp.c                         |   6 +
+ kernel/stop_machine.c                |   3 +
+ kni/Kbuild                           |   6 +
+ kni/compat.h                         | 157 +++++
+ kni/kni_dev.h                        | 137 +++++
+ kni/kni_fifo.h                       |  87 +++
+ kni/kni_misc.c                       | 719 ++++++++++++++++++++++
+ kni/kni_net.c                        | 878 +++++++++++++++++++++++++++
+ kni/meson.build                      |  16 +
+ kni/rte_kni.c                        | 843 +++++++++++++++++++++++++
+ kni/rte_kni.h                        | 269 ++++++++
+ kni/rte_kni_common.h                 | 149 +++++
+ kni/rte_kni_fifo.h                   | 117 ++++
+ kni/version.map                      |  24 +
+ lib/iov_iter.c                       |   2 +
+ lib/strncpy_from_user.c              |   1 +
+ lib/usercopy.c                       |   2 +
+ mm/gup.c                             |   2 +-
+ mm/memory.c                          |  15 +-
+ 52 files changed, 6127 insertions(+), 24 deletions(-)
+ create mode 100644 arch/x86/include/asm/kernel_rr.h
+ create mode 100644 arch/x86/kernel/kernel_rr.c
+ create mode 100644 arch/x86/kernel/kvm_ivshmem.c
+ create mode 100644 arch/x86/kernel/rr_serialize.c
+ create mode 100644 igb_uio/Kbuild
+ create mode 100644 igb_uio/Makefile
+ create mode 100644 igb_uio/compat.h
+ create mode 100644 igb_uio/igb_uio.c
+ create mode 100644 igb_uio/meson.build
+ create mode 100644 kni/Kbuild
+ create mode 100644 kni/compat.h
+ create mode 100644 kni/kni_dev.h
+ create mode 100644 kni/kni_fifo.h
+ create mode 100644 kni/kni_misc.c
+ create mode 100644 kni/kni_net.c
+ create mode 100644 kni/meson.build
+ create mode 100644 kni/rte_kni.c
+ create mode 100644 kni/rte_kni.h
+ create mode 100644 kni/rte_kni_common.h
+ create mode 100644 kni/rte_kni_fifo.h
+ create mode 100644 kni/version.map
+
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index 6c2826417..b018a695a 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -72,6 +72,8 @@ static __always_inline bool do_syscall_x32(struct pt_regs *regs, int nr)
+ 
+ __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
+ {
++	rr_handle_syscall(regs);
++
+ 	add_random_kstack_offset();
+ 	nr = syscall_enter_from_user_mode(regs, nr);
+ 
+@@ -84,6 +86,7 @@ __visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
+ 
+ 	instrumentation_end();
+ 	syscall_exit_to_user_mode(regs);
++	rr_release_smp_exec(CTX_SYSCALL);
+ }
+ #endif
+ 
+diff --git a/arch/x86/entry/vdso/vclock_gettime.c b/arch/x86/entry/vdso/vclock_gettime.c
+index 7d70935b6..ebe02c9a3 100644
+--- a/arch/x86/entry/vdso/vclock_gettime.c
++++ b/arch/x86/entry/vdso/vclock_gettime.c
+@@ -8,6 +8,8 @@
+  * 32 Bit compat layer by Stefani Seibold <stefani@seibold.net>
+  *  sponsored by Rohde & Schwarz GmbH & Co. KG Munich/Germany
+  */
++#define VDSO_BUILD 0
++
+ #include <linux/time.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+diff --git a/arch/x86/include/asm/archrandom.h b/arch/x86/include/asm/archrandom.h
+index 02bae8e07..6648311ff 100644
+--- a/arch/x86/include/asm/archrandom.h
++++ b/arch/x86/include/asm/archrandom.h
+@@ -12,6 +12,7 @@
+ 
+ #include <asm/processor.h>
+ #include <asm/cpufeature.h>
++#include <asm/kernel_rr.h>
+ 
+ #define RDRAND_RETRY_LOOPS	10
+ 
+@@ -37,6 +38,9 @@ static inline bool __must_check rdseed_long(unsigned long *v)
+ 	asm volatile("rdseed %[out]"
+ 		     CC_SET(c)
+ 		     : CC_OUT(c) (ok), [out] "=r" (*v));
++
++	rr_record_rdseed(*v);
++
+ 	return ok;
+ }
+ 
+diff --git a/arch/x86/include/asm/kernel_rr.h b/arch/x86/include/asm/kernel_rr.h
+new file mode 100644
+index 000000000..c4d132382
+--- /dev/null
++++ b/arch/x86/include/asm/kernel_rr.h
+@@ -0,0 +1,166 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _ASM_X86_KERNEL_RR_H
++#define _ASM_X86_KERNEL_RR_H
++#include <linux/types.h>
++#include <linux/kvm.h>
++
++#define EVENT_TYPE_INTERRUPT 0
++#define EVENT_TYPE_EXCEPTION 1
++#define EVENT_TYPE_SYSCALL   2
++#define EVENT_TYPE_CFU       4
++#define EVENT_TYPE_RANDOM    5
++#define EVENT_TYPE_RDTSC     6
++#define EVENT_TYPE_GFU       8
++#define EVENT_TYPE_STRNLEN   9
++#define EVENT_TYPE_RDSEED    10
++#define EVENT_TYPE_RELEASE   11
++#define EVENT_TYPE_PTE       14
++
++#define CFU_BUFFER_SIZE     4096
++
++#define CTX_SYSCALL 0
++#define CTX_INTR 1
++#define CTX_SWITCH 2
++#define CTX_IDLE 3
++#define CTX_LOCKWAIT 4
++#define CTX_EXCP    5
++
++
++typedef struct {
++    int id;
++    unsigned long value;
++    unsigned long inst_cnt;
++    unsigned long rip;
++} rr_io_input;
++
++typedef struct {
++    int id;
++    int vector;
++    unsigned long ecx;
++    int from;
++    unsigned long spin_count;
++    unsigned long inst_cnt;
++    unsigned long rip;
++    struct kvm_regs regs;
++} rr_interrupt;
++
++typedef struct {
++    int id;
++    unsigned long val;
++    unsigned long ptr;
++    int size;
++} rr_gfu;
++
++typedef struct {
++    int id;
++    unsigned long src_addr;
++    unsigned long dest_addr;
++    unsigned long len;
++    unsigned long rdx;
++    unsigned char *data;
++} rr_cfu;
++
++typedef struct {
++    int id;
++    int exception_index;
++    int error_code;
++    unsigned long cr2, cr3;
++    struct kvm_regs regs;
++    unsigned long spin_count;
++    unsigned long inst_cnt;
++} rr_exception;
++
++typedef struct {
++    int id;
++    struct kvm_regs regs;
++    unsigned long kernel_gsbase, msr_gsbase, cr3;
++    unsigned long spin_count;
++} rr_syscall;
++
++typedef struct {
++    int id;
++    unsigned long buf;
++    unsigned long len;
++    __u8 data[1024];
++} rr_random;
++
++typedef struct rr_event_log_guest_t {
++    int type;
++    int id;
++    union {
++        rr_interrupt interrupt;
++        rr_exception exception;
++        rr_syscall  syscall;
++        rr_io_input io_input;
++        rr_cfu cfu;
++        rr_random rand;
++        rr_gfu gfu;
++    } event;
++    unsigned long inst_cnt;
++    unsigned long rip;
++} rr_event_log_guest;
++
++
++typedef struct rr_event_guest_queue_header_t {
++    unsigned int current_pos;
++    unsigned int total_pos;
++    unsigned int header_size;
++    unsigned int entry_size;
++    unsigned int rr_enabled;
++    unsigned long current_byte;
++    unsigned long total_size;
++    unsigned long rotated_bytes;
++} rr_event_guest_queue_header;
++
++typedef struct rr_event_entry_header_t {
++    int type;
++} rr_event_entry_header;
++
++void rr_record_rdseed(unsigned long val);
++void *rr_alloc_new_event_entry(unsigned long size, int type);
++bool rr_queue_inited(void);
++int rr_enabled(void);
++void *rr_record_cfu(const void __user *from, void *to, long unsigned int n);
++void rr_record_gfu(unsigned long val, unsigned long ptr);
++void rr_record_release(int cpu_id);
++
++void init_smp_exec_lock(void);
++long rr_acquire_smp_exec(int ctx, int disable_irq);
++void rr_release_smp_exec(int ctx);
++long rr_do_acquire_smp_exec(int disable_irq, int cpu_id, int ctx);
++void rr_handle_irqentry(void);
++// bool rr_is_switch_to_user(struct task_struct *task, bool before);
++void rr_bug(int expected, int cur);
++void rr_set_lock_owner(int owner);
++void rr_begin_cfu(const void __user *from, void *to, long unsigned int n);
++void *rr_gfu_begin(const void __user *ptr, int size, int align);
++void rr_record_gfu_end(unsigned long val, void *event);
++void *rr_cfu_begin(const void __user *from, void *to, long unsigned int n);
++void rr_cfu_end(void *addr, void *to, long unsigned int n);
++void *rr_record_pte_begin(unsigned long ptr);
++void rr_record_pte_end(void *event, unsigned long pte_val);
++unsigned long rr_record_pte_clear(pte_t *xp);
++pte_t rr_read_pte(pte_t *pte);
++pte_t rr_read_pte_once(pte_t *pte);
++unsigned long *rr_rdtsc_begin(void);
++rr_interrupt *rr_get_cpu_intr_info(int cpu_id);
++
++/* === io uring related functions === */
++void rr_begin_record_io_uring(void);
++void rr_end_record_io_uring(unsigned int value, unsigned long addr);
++void rr_record_io_uring_entry(void *data, int size, unsigned long addr);
++
++#define RECORD_SQ_TAIL(stmt, addr) ({ \
++   unsigned int tail; \
++   rr_begin_record_io_uring(); \
++   tail = (stmt); \
++   rr_end_record_io_uring(tail, (unsigned long)addr); \
++   tail; \
++})
++
++#define RECORD_IO_URING_ENTRY(data, size) ({ \
++   rr_record_io_uring_entry((void *)data, size, (unsigned long)data); \
++   data; \
++})
++
++#endif /* _ASM_X86_KERNEL_RR_H */
+diff --git a/arch/x86/include/asm/msr.h b/arch/x86/include/asm/msr.h
+index 65ec1965c..9630fe384 100644
+--- a/arch/x86/include/asm/msr.h
++++ b/arch/x86/include/asm/msr.h
+@@ -6,6 +6,30 @@
+ 
+ #ifndef __ASSEMBLY__
+ 
++#ifndef VDSO_BUILD
++#include <asm/pgtable_64_types.h>
++#include <asm/kernel_rr.h>
++#include <linux/irqflags.h>
++
++#define RR_RDTSC_BEGIN(expr) ({ \
++    unsigned long flags; \
++    void *event; \
++    if (!rr_queue_inited() || !rr_enabled()) { \
++		expr; \
++	} else { \
++        local_irq_save(flags); \
++        event = rr_alloc_new_event_entry(sizeof(rr_io_input), EVENT_TYPE_RDTSC); \
++        if (event == NULL) { \
++            panic("Failed to allocate entry"); \
++        } \
++        input = (rr_io_input *)event; \
++        input->id = 0; \
++		expr; \
++        local_irq_restore(flags); \
++    } \
++})
++
++#endif
+ #include <asm/asm.h>
+ #include <asm/errno.h>
+ #include <asm/cpumask.h>
+@@ -181,9 +205,21 @@ static __always_inline unsigned long long rdtsc(void)
+ {
+ 	DECLARE_ARGS(val, low, high);
+ 
+-	asm volatile("rdtsc" : EAX_EDX_RET(val, low, high));
++#ifndef VDSO_BUILD
++    rr_io_input *input = NULL;
++
++	RR_RDTSC_BEGIN(asm volatile("rdtsc" : EAX_EDX_RET(val, low, high)));
+ 
++	if (unlikely(input == NULL)) {
++		return EAX_EDX_VAL(val, low, high);
++	}
++
++	input->value = EAX_EDX_VAL(val, low, high);
++	return input->value;
++#else
++	asm volatile("rdtsc" : EAX_EDX_RET(val, low, high));
+ 	return EAX_EDX_VAL(val, low, high);
++#endif
+ }
+ 
+ /**
+@@ -198,6 +234,9 @@ static __always_inline unsigned long long rdtsc_ordered(void)
+ {
+ 	DECLARE_ARGS(val, low, high);
+ 
++#ifndef VDSO_BUILD
++    rr_io_input *input = NULL;
++
+ 	/*
+ 	 * The RDTSC instruction is not ordered relative to memory
+ 	 * access.  The Intel SDM and the AMD APM are both vague on this
+@@ -212,6 +251,20 @@ static __always_inline unsigned long long rdtsc_ordered(void)
+ 	 * Thus, use the preferred barrier on the respective CPU, aiming for
+ 	 * RDTSCP as the default.
+ 	 */
++	RR_RDTSC_BEGIN(asm volatile(ALTERNATIVE_2("rdtsc",
++				   "lfence; rdtsc", X86_FEATURE_LFENCE_RDTSC,
++				   "rdtscp", X86_FEATURE_RDTSCP)
++			: EAX_EDX_RET(val, low, high)
++			/* RDTSCP clobbers ECX with MSR_TSC_AUX. */
++			:: "ecx"));
++
++	if (unlikely(input == NULL)) {
++		return EAX_EDX_VAL(val, low, high);
++	}
++
++	input->value = EAX_EDX_VAL(val, low, high);
++	return input->value;
++#else
+ 	asm volatile(ALTERNATIVE_2("rdtsc",
+ 				   "lfence; rdtsc", X86_FEATURE_LFENCE_RDTSC,
+ 				   "rdtscp", X86_FEATURE_RDTSCP)
+@@ -220,6 +273,7 @@ static __always_inline unsigned long long rdtsc_ordered(void)
+ 			:: "ecx");
+ 
+ 	return EAX_EDX_VAL(val, low, high);
++#endif
+ }
+ 
+ static inline unsigned long long native_read_pmc(int counter)
+diff --git a/arch/x86/include/asm/pgtable_64.h b/arch/x86/include/asm/pgtable_64.h
+index e479491da..7f942c4cc 100644
+--- a/arch/x86/include/asm/pgtable_64.h
++++ b/arch/x86/include/asm/pgtable_64.h
+@@ -15,6 +15,7 @@
+ #include <linux/bitops.h>
+ #include <linux/threads.h>
+ #include <asm/fixmap.h>
++#include <asm/kernel_rr.h>
+ 
+ extern p4d_t level4_kernel_pgt[512];
+ extern p4d_t level4_ident_pgt[512];
+@@ -91,7 +92,8 @@ static inline void native_pmd_clear(pmd_t *pmd)
+ static inline pte_t native_ptep_get_and_clear(pte_t *xp)
+ {
+ #ifdef CONFIG_SMP
+-	return native_make_pte(xchg(&xp->pte, 0));
++	pteval_t p = rr_record_pte_clear(xp);
++	return native_make_pte(p);
+ #else
+ 	/* native_local_ptep_get_and_clear,
+ 	   but duplicated because of cyclic dependency */
+diff --git a/arch/x86/include/asm/syscall.h b/arch/x86/include/asm/syscall.h
+index 5b85987a5..2a2848077 100644
+--- a/arch/x86/include/asm/syscall.h
++++ b/arch/x86/include/asm/syscall.h
+@@ -118,6 +118,8 @@ static inline void syscall_get_arguments(struct task_struct *task,
+ 	}
+ }
+ 
++void rr_handle_syscall(struct pt_regs *regs);
++
+ static inline int syscall_get_arch(struct task_struct *task)
+ {
+ 	/* x32 tasks should be considered AUDIT_ARCH_X86_64. */
+diff --git a/arch/x86/include/asm/traps.h b/arch/x86/include/asm/traps.h
+index 47ecfff2c..5233eb15e 100644
+--- a/arch/x86/include/asm/traps.h
++++ b/arch/x86/include/asm/traps.h
+@@ -47,4 +47,6 @@ void __noreturn handle_stack_overflow(struct pt_regs *regs,
+ 				      struct stack_info *info);
+ #endif
+ 
++void rr_handle_exception(struct pt_regs *regs, int vector, int error_code, unsigned long cr2);
++
+ #endif /* _ASM_X86_TRAPS_H */
+diff --git a/arch/x86/include/asm/uaccess.h b/arch/x86/include/asm/uaccess.h
+index 1cc756eaf..89b2cbad6 100644
+--- a/arch/x86/include/asm/uaccess.h
++++ b/arch/x86/include/asm/uaccess.h
+@@ -12,6 +12,7 @@
+ #include <asm/page.h>
+ #include <asm/smap.h>
+ #include <asm/extable.h>
++#include <asm/kernel_rr.h>
+ 
+ #ifdef CONFIG_DEBUG_ATOMIC_SLEEP
+ static inline bool pagefault_disabled(void);
+@@ -98,13 +99,16 @@ extern int __get_user_bad(void);
+ #define do_get_user_call(fn,x,ptr)					\
+ ({									\
+ 	int __ret_gu;							\
++	void *rr_event;	\
+ 	register __inttype(*(ptr)) __val_gu asm("%"_ASM_DX);		\
+ 	__chk_user_ptr(ptr);						\
++	rr_event = rr_gfu_begin(ptr, sizeof(*(ptr)), 1);	\
+ 	asm volatile("call __" #fn "_%P4"				\
+ 		     : "=a" (__ret_gu), "=r" (__val_gu),		\
+ 			ASM_CALL_CONSTRAINT				\
+ 		     : "0" (ptr), "i" (sizeof(*(ptr))));		\
+ 	instrument_get_user(__val_gu);					\
++	rr_record_gfu_end(__val_gu, rr_event);	\
+ 	(x) = (__force __typeof__(*(ptr))) __val_gu;			\
+ 	__builtin_expect(__ret_gu, 0);					\
+ })
+@@ -563,11 +567,14 @@ static __must_check __always_inline bool user_access_begin(const void __user *pt
+ 	__put_user_size((__typeof__(*(ptr)))(x), (ptr), sizeof(*(ptr)), label)
+ 
+ #ifdef CONFIG_CC_HAS_ASM_GOTO_OUTPUT
++
+ #define unsafe_get_user(x, ptr, err_label)					\
+ do {										\
+ 	__inttype(*(ptr)) __gu_val;						\
++	void *event = rr_gfu_begin(ptr, sizeof(*(ptr)), 0);	\
+ 	__get_user_size(__gu_val, (ptr), sizeof(*(ptr)), err_label);		\
+ 	(x) = (__force __typeof__(*(ptr)))__gu_val;				\
++	rr_record_gfu_end(__gu_val, event);	\
+ } while (0)
+ #else // !CONFIG_CC_HAS_ASM_GOTO_OUTPUT
+ #define unsafe_get_user(x, ptr, err_label)					\
+@@ -576,6 +583,7 @@ do {										\
+ 	__inttype(*(ptr)) __gu_val;						\
+ 	__get_user_size(__gu_val, (ptr), sizeof(*(ptr)), __gu_err);		\
+ 	(x) = (__force __typeof__(*(ptr)))__gu_val;				\
++	rr_record_gfu(__gu_val, (unsigned long)ptr);	\
+ 	if (unlikely(__gu_err)) goto err_label;					\
+ } while (0)
+ #endif // CONFIG_CC_HAS_ASM_GOTO_OUTPUT
+diff --git a/arch/x86/include/asm/uaccess_64.h b/arch/x86/include/asm/uaccess_64.h
+index d13d71af5..52a6082e3 100644
+--- a/arch/x86/include/asm/uaccess_64.h
++++ b/arch/x86/include/asm/uaccess_64.h
+@@ -11,6 +11,7 @@
+ #include <asm/alternative.h>
+ #include <asm/cpufeatures.h>
+ #include <asm/page.h>
++#include <asm/kernel_rr.h>
+ 
+ /*
+  * Copy To/From Userspace
+@@ -49,7 +50,14 @@ copy_user_generic(void *to, const void *from, unsigned len)
+ static __always_inline __must_check unsigned long
+ raw_copy_from_user(void *dst, const void __user *src, unsigned long size)
+ {
+-	return copy_user_generic(dst, (__force void *)src, size);
++	unsigned long ret;
++	void *addr;
++
++	addr = rr_cfu_begin(src, dst, size);
++	ret = copy_user_generic(dst, (__force void *)src, size);
++	rr_cfu_end(addr, dst, size - ret);
++
++	return ret;
+ }
+ 
+ static __always_inline __must_check unsigned long
+diff --git a/arch/x86/kernel/Makefile b/arch/x86/kernel/Makefile
+index f901658d9..a8c6fa3e5 100644
+--- a/arch/x86/kernel/Makefile
++++ b/arch/x86/kernel/Makefile
+@@ -32,6 +32,10 @@ KCSAN_SANITIZE := n
+ KMSAN_SANITIZE_head$(BITS).o				:= n
+ KMSAN_SANITIZE_nmi.o					:= n
+ 
++KASAN_SANITIZE_kernel_rr.o := n
++KASAN_SANITIZE_rr_serialize.o := n
++KASAN_SANITIZE_kvm_ivshmem.o := n
++
+ # If instrumentation of this dir is enabled, boot hangs during first second.
+ # Probably could be more selective here, but note that files related to irqs,
+ # boot, dumpstack/stacktrace, etc are either non-interesting or can lead to
+@@ -69,6 +73,9 @@ obj-y			+= static_call.o
+ obj-y				+= process.o
+ obj-y				+= fpu/
+ obj-y				+= ptrace.o
++obj-y               += rr_serialize.o
++obj-y				+= kernel_rr.o
++obj-y				+= kvm_ivshmem.o
+ obj-$(CONFIG_X86_32)		+= tls.o
+ obj-$(CONFIG_IA32_EMULATION)	+= tls.o
+ obj-y				+= step.o
+diff --git a/arch/x86/kernel/kernel_rr.c b/arch/x86/kernel/kernel_rr.c
+new file mode 100644
+index 000000000..a6dcbf061
+--- /dev/null
++++ b/arch/x86/kernel/kernel_rr.c
+@@ -0,0 +1,760 @@
++#include <asm/pgtable_64_types.h>
++#include <asm/kernel_rr.h>
++#include <asm/traps.h>
++#include <linux/ptrace.h>
++#include <asm/msr.h>
++#include <linux/highmem-internal.h>
++
++/*
++ * Record syscall event with register state and spin count
++ */
++static void rr_record_syscall(struct pt_regs *regs, int cpu_id, unsigned long spin_count)
++{
++    unsigned long flags;
++    void *event = NULL;
++    rr_syscall *syscall = NULL;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_syscall), EVENT_TYPE_SYSCALL);
++    if (event == NULL) {
++	    panic("Failed to allocate entry");
++        //goto finish;
++    }
++
++    syscall = (rr_syscall *)event;
++
++    syscall->id = cpu_id;
++    syscall->spin_count = 0;
++    syscall->regs.rax = regs->orig_ax;
++    syscall->regs.rbx = regs->bx;
++    syscall->regs.rcx = regs->cx;
++    syscall->regs.rdx = regs->dx;
++    syscall->regs.rsi = regs->si;
++    syscall->regs.rdi = regs->di;
++    syscall->regs.rsp = regs->sp;
++    syscall->regs.rbp = regs->bp;
++    syscall->regs.r8 = regs->r8;
++    syscall->regs.r9 = regs->r9;
++    syscall->regs.r10 = regs->r10;
++    syscall->regs.r11 = regs->r11;
++    syscall->regs.r12 = regs->r12;
++    syscall->regs.r13 = regs->r13;
++    syscall->regs.r14 = regs->r14;
++    syscall->regs.r15 = regs->r15;
++    syscall->cr3 = __read_cr3(); 
++    syscall->spin_count = spin_count;
++
++    local_irq_restore(flags);
++}
++
++/*
++ * Record exception event with register state and exception details
++ */
++static void rr_record_exception(struct pt_regs *regs,
++                                int vector, int error_code,
++                                unsigned long cr2, int cpu_id,
++                                unsigned long spin_count)
++{
++
++    unsigned long flags;
++    void *event;
++    rr_exception *exception = NULL;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_exception), EVENT_TYPE_EXCEPTION);
++    if (event == NULL) {
++	    panic("Failed to allocate entry");
++        //goto finish;
++    }
++
++    exception = (rr_exception *)event;
++
++    exception->id = cpu_id;
++    exception->exception_index = vector;
++    exception->cr2 = cr2;
++    exception->error_code = error_code;
++    exception->regs.rax = regs->ax;
++    exception->regs.rbx = regs->bx;
++    exception->regs.rcx = regs->cx;
++    exception->regs.rdx = regs->dx;
++    exception->regs.rsi = regs->si;
++    exception->regs.rdi = regs->di;
++    exception->regs.rsp = regs->sp;
++    exception->regs.rbp = regs->bp;
++    exception->regs.r8 = regs->r8;
++    exception->regs.r9 = regs->r9;
++    exception->regs.r10 = regs->r10;
++    exception->regs.r11 = regs->r11;
++    exception->regs.r12 = regs->r12;
++    exception->regs.r13 = regs->r13;
++    exception->regs.r14 = regs->r14;
++    exception->regs.r15 = regs->r15;
++    exception->regs.rflags = regs->flags;
++    exception->regs.rip = regs->ip;
++
++    exception->spin_count = spin_count;
++
++    local_irq_restore(flags);
++}
++
++/*
++ * Handle syscall recording with lock acquisition
++ */
++void rr_handle_syscall(struct pt_regs *regs)
++{
++    int cpu_id;
++    unsigned long flags;
++    long spin_count;
++
++    local_irq_save(flags);
++
++    preempt_disable();
++    cpu_id = smp_processor_id();
++
++    spin_count = rr_do_acquire_smp_exec(0, cpu_id, CTX_SYSCALL);
++
++    if (spin_count < 0)
++        spin_count = 0;
++
++    rr_record_syscall(regs, cpu_id, spin_count);
++
++    preempt_enable();
++    local_irq_restore(flags);
++}
++
++/*
++ * Handle exception recording with lock acquisition
++ */
++void rr_handle_exception(struct pt_regs *regs, int vector, int error_code, unsigned long cr2)
++{
++    int cpu_id;
++    unsigned long flags;
++    long spin_count;
++
++    local_irq_save(flags);
++
++    preempt_disable();
++    cpu_id = smp_processor_id();
++
++    spin_count = rr_do_acquire_smp_exec(0, cpu_id, CTX_EXCP);
++
++    if (spin_count < 0)
++        spin_count = 0;
++
++    rr_record_exception(regs, vector, error_code, cr2, cpu_id, spin_count);
++
++    preempt_enable();
++    local_irq_restore(flags);
++}
++
++/*
++ * Record interrupt entry event
++ */
++static void rr_record_irqentry(int cpu_id, unsigned long spin_count, rr_interrupt *info)
++{
++    rr_event_log_guest *event;
++    rr_interrupt *interrupt;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    event = rr_alloc_new_event_entry(sizeof(rr_interrupt), EVENT_TYPE_INTERRUPT);
++    if (event == NULL) {
++        panic("Failed to allocate");
++    }
++
++    interrupt = (rr_interrupt *)event;
++    memcpy(interrupt, info, sizeof(rr_interrupt));
++
++    interrupt->id = cpu_id;
++    interrupt->from = 3;
++    interrupt->spin_count = spin_count;
++}
++
++/*
++ * Handle interrupt entry recording with lock acquisition
++ */
++void rr_handle_irqentry(void)
++{
++    int cpu_id;
++    unsigned long flags;
++    long spin_count;
++
++    local_irq_save(flags);
++
++    preempt_disable();
++    cpu_id = smp_processor_id();
++
++    spin_count = rr_do_acquire_smp_exec(0, cpu_id, CTX_INTR);
++    if (spin_count < 0) {
++        goto finish;
++    }
++
++    rr_record_irqentry(cpu_id, spin_count, rr_get_cpu_intr_info(cpu_id));
++
++finish:
++    preempt_enable();
++    local_irq_restore(flags);
++}
++
++/*
++ * Record copy_from_user operation with data buffer
++ * Returns: buffer address or NULL if failed/disabled
++ */
++void *rr_record_cfu(const void __user *from, void *to, long unsigned int n)
++{
++    unsigned long flags;
++    long ret;
++    void *event;
++    rr_cfu *cfu;
++    void *addr;
++
++    if (!rr_queue_inited()) {
++        return NULL;
++    }
++
++    if (!rr_enabled()) {
++        return NULL;
++    }
++
++    local_irq_save(flags);
++
++    /* We reserve one more byte here for the buffer so in the replay, the extra byte is filled with
++       zero */
++    rr_begin_cfu(from, to, n);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_cfu) + (n + 1) * sizeof(unsigned char), EVENT_TYPE_CFU);
++    if (event == NULL) {
++        panic("Failed to allocate");
++        goto finish;
++    }
++
++    cfu = (rr_cfu *)event;
++
++    cfu->id = 0;
++    cfu->src_addr = (unsigned long)from;
++    cfu->dest_addr = (unsigned long)to;
++    cfu->len = n + 1;
++    cfu->data = NULL;
++
++    addr = (void *)((unsigned long)cfu + sizeof(rr_cfu));
++    ret = raw_copy_from_user(addr, from, n);
++
++finish:
++    local_irq_restore(flags);
++
++    return addr;
++}
++
++/*
++ * Begin get_from_user recording
++ * Returns: event pointer or NULL if failed/disabled
++ */
++void *rr_gfu_begin(const void __user *ptr, int size, int align)
++{
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu;
++
++    if (!rr_queue_inited()) {
++        return NULL;
++    }
++
++    if (!rr_enabled()) {
++        return NULL;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_GFU);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->ptr = (unsigned long)ptr;
++    gfu->size = size;
++
++    local_irq_restore(flags);
++
++    return event;
++}
++
++/*
++ * Begin copy_from_user recording
++ * Returns: buffer address or NULL if failed/disabled
++ */
++void *rr_cfu_begin(const void __user *from, void *to, long unsigned int n)
++{
++    unsigned long flags;
++    void *event;
++    rr_cfu *cfu = NULL;
++    unsigned long len;
++    void *addr;
++
++    if (!rr_queue_inited()) {
++        return NULL;
++    }
++
++    if (!rr_enabled()) {
++        return NULL;
++    }
++
++    local_irq_save(flags);
++
++    len = sizeof(rr_cfu) + (n + 1) * sizeof(unsigned char);
++    event = rr_alloc_new_event_entry(len, EVENT_TYPE_CFU);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    cfu = (rr_cfu *)event;
++
++    cfu->id = 0;
++    cfu->src_addr = (unsigned long)from;
++    cfu->dest_addr = (unsigned long)to;
++    cfu->len = n + 1;
++    cfu->data = NULL;
++    addr = (void *)((unsigned long)cfu + sizeof(rr_cfu));
++
++    local_irq_restore(flags);
++
++    return addr;
++}
++
++/*
++ * End copy_from_user recording by copying data to buffer
++ */
++void rr_cfu_end(void *addr, void *to, long unsigned int n)
++{
++    unsigned long flags;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    if (!addr) {
++        return;
++    }
++
++    local_irq_save(flags);
++    memcpy(addr, to, n);
++    local_irq_restore(flags);
++}
++
++/*
++ * Complete get_from_user recording with result value
++ */
++void rr_record_gfu_end(unsigned long val, void *event)
++{
++    rr_gfu *gfu;
++
++    if (!event)
++        return;
++
++    gfu = (rr_gfu *)event;
++    gfu->val = val;
++}
++
++/*
++ * Record get_from_user operation
++ */
++void rr_record_gfu(unsigned long val, unsigned long ptr)
++{
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_GFU);
++    if (event == NULL) {
++        panic("Failed to allocate");
++        goto finish;
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->val = val;
++    gfu->ptr = ptr;
++
++finish:
++    local_irq_restore(flags);
++}
++
++/*
++ * Record RDSEED instruction result
++ */
++void rr_record_rdseed(unsigned long val)
++{
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu = NULL;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_RDSEED);
++    if (event == NULL) {
++        panic("Failed to allocate");
++        goto finish;
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->val = val;
++
++finish:
++    local_irq_restore(flags);
++}
++
++/*
++ * Record lock release event, only used for debug purpose
++ */
++void rr_record_release(int cpu_id)
++{
++    rr_event_log_guest *event;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    event = rr_alloc_new_event_entry(sizeof(rr_event_log_guest), EVENT_TYPE_RELEASE);
++    if (event == NULL) {
++        panic("Failed to allocate");
++        return;
++    }
++
++    event->type = EVENT_TYPE_RELEASE;
++    event->id = cpu_id;
++}
++
++/*
++ * Stub for copy_from_user begin operation
++ */
++void rr_begin_cfu(const void __user *from, void *to, long unsigned int n)
++{ return; }
++
++/*
++ * Record page table entry clear operation
++ * Returns: original PTE value
++ */
++unsigned long rr_record_pte_clear(pte_t *xp)
++{
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu = NULL;
++
++    pteval_t p = xchg(&xp->pte, 0);
++
++    if (!rr_queue_inited()) {
++        return p;
++    }
++
++    if (!rr_enabled()) {
++        return p;
++    }
++
++    if (!(p & _PAGE_USER)) {
++        return p;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_PTE);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->ptr = (unsigned long)xp;
++    gfu->val = p;
++
++    local_irq_restore(flags);
++
++    return p;
++}
++
++/*
++ * Record page table entry read operation
++ * Returns: PTE value
++ */
++pte_t rr_read_pte(pte_t *pte)
++{
++    pte_t rr_pte;
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu;
++
++    rr_pte = *pte;
++
++    if (!rr_queue_inited()) {
++        return rr_pte;
++    }
++
++    if (!rr_enabled()) {
++        return rr_pte;
++    }
++
++    if (!(rr_pte.pte & _PAGE_USER)) {
++        return rr_pte;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_PTE);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->ptr = (unsigned long)pte;
++    gfu->val = rr_pte.pte;
++
++    local_irq_restore(flags);
++
++    return rr_pte;
++}
++
++/*
++ * Record page table entry atomic read operation
++ * Returns: PTE value
++ */
++pte_t rr_read_pte_once(pte_t *pte)
++{
++    pte_t rr_pte;
++    unsigned long flags;
++    void *event;
++    rr_gfu *gfu;
++
++    rr_pte = READ_ONCE(*pte);
++
++    if (!rr_queue_inited()) {
++        return rr_pte;
++    }
++
++    if (!rr_enabled()) {
++        return rr_pte;
++    }
++
++    if (!(rr_pte.pte & _PAGE_USER)) {
++        return rr_pte;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_PTE);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    gfu = (rr_gfu *)event;
++
++    gfu->id = 0;
++    gfu->ptr = (unsigned long)pte;
++    gfu->val = rr_pte.pte;
++
++    local_irq_restore(flags);
++
++    return rr_pte;
++}
++
++/*
++ * Begin RDTSC recording
++ * Returns: pointer to value field or NULL if failed/disabled
++ */
++unsigned long *rr_rdtsc_begin(void)
++{
++    unsigned long flags;
++    void *event;
++    rr_io_input *input = NULL;
++
++    if (!rr_queue_inited()) {
++        return NULL;
++    }
++
++    if (!rr_enabled()) {
++        return NULL;
++    }
++
++    local_irq_save(flags);
++
++    event = rr_alloc_new_event_entry(sizeof(rr_io_input), EVENT_TYPE_RDTSC);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    input = (rr_io_input *)event;
++
++    input->id = 0;
++
++    local_irq_restore(flags);
++
++    return &(input->value);
++}
++
++/*
++ * Record page mapping with full page content
++ * Returns: original address
++ */
++void *rr_record_page_map(struct page *p, void *addr)
++{
++    unsigned long flags;
++    rr_cfu *event;
++    void *dst_addr;
++
++    if (!rr_queue_inited()) {
++        return addr;
++    }
++
++    if (!rr_enabled()) {
++        return addr;
++    }
++
++    local_irq_save(flags);
++
++    event = (rr_cfu *)rr_alloc_new_event_entry(sizeof(rr_cfu) + PAGE_SIZE, EVENT_TYPE_CFU);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    event->id = 0;
++    event->src_addr = (unsigned long)addr;
++    event->dest_addr = 0;
++    event->len = PAGE_SIZE;
++    event->data = NULL;
++
++    dst_addr = (void *)((unsigned long)event + sizeof(rr_cfu));
++
++    memcpy(dst_addr, addr, PAGE_SIZE);
++
++    local_irq_restore(flags);
++
++    return addr;
++}
++
++/*
++ * End io_uring recording with result value
++ */
++void rr_end_record_io_uring(unsigned int value, unsigned long addr)
++{
++    unsigned long flags;
++    rr_gfu *event;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = (rr_gfu *)rr_alloc_new_event_entry(sizeof(rr_gfu), EVENT_TYPE_GFU);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++    event->val = value;
++    event->ptr = addr;
++    event->size = sizeof(unsigned int);
++
++    local_irq_restore(flags);
++}
++
++/*
++ * Stub for io_uring begin operation
++ */
++void rr_begin_record_io_uring(void)
++{
++    return;
++}
++
++/*
++ * Record io_uring entry with data
++ */
++void rr_record_io_uring_entry(void *data, int size, unsigned long addr)
++{
++    unsigned long flags;
++    rr_cfu *event;
++    void *dst_addr;
++
++    if (!rr_queue_inited()) {
++        return;
++    }
++
++    if (!rr_enabled()) {
++        return;
++    }
++
++    local_irq_save(flags);
++
++    event = (rr_cfu *)rr_alloc_new_event_entry(sizeof(rr_cfu) + size * sizeof(unsigned char), EVENT_TYPE_CFU);
++    if (event == NULL) {
++        panic("Failed to allocate entry");
++    }
++
++    dst_addr = (void *)((unsigned long)event + sizeof(rr_cfu));
++
++    event->len = size;
++    event->src_addr = addr;
++    event->data = NULL;
++
++    memcpy(dst_addr, data, size);
++
++    local_irq_restore(flags);
++}
+diff --git a/arch/x86/kernel/kvm_ivshmem.c b/arch/x86/kernel/kvm_ivshmem.c
+new file mode 100644
+index 000000000..ce86eb7b7
+--- /dev/null
++++ b/arch/x86/kernel/kvm_ivshmem.c
+@@ -0,0 +1,599 @@
++/*
++ * drivers/char/kvm_ivshmem.c - driver for KVM Inter-VM shared memory PCI device
++ *
++ * Copyright 2009 Cam Macdonell <cam@cs.ualberta.ca>
++ *
++ * Based on cirrusfb.c and 8139cp.c:
++ *         Copyright 1999-2001 Jeff Garzik
++ *         Copyright 2001-2004 Jeff Garzik
++ *
++ */
++
++#include <linux/init.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/proc_fs.h>
++#include <linux/hardirq.h>
++#include <asm/uaccess.h>
++#include <linux/interrupt.h>
++#include <linux/kvm_para.h>
++
++#include <asm/kernel_rr.h>
++
++
++#define TRUE 1
++#define FALSE 0
++#define KVM_IVSHMEM_DEVICE_MINOR_NUM 0
++
++enum {
++	/* KVM Inter-VM shared memory device register offsets */
++	IntrMask        = 0x00,    /* Interrupt Mask */
++	IntrStatus      = 0x04,    /* Interrupt Status */
++	IVPosition      = 0x08,    /* VM ID */
++	Doorbell        = 0x0c,    /* Doorbell */
++};
++
++typedef struct kvm_ivshmem_device {
++	void __iomem * regs;
++
++	void * base_addr;
++
++	unsigned int regaddr;
++	unsigned int reg_size;
++
++	unsigned int ioaddr;
++	unsigned long ioaddr_size;
++	unsigned int irq;
++
++	struct pci_dev *dev;
++	char (*msix_names)[256];
++	struct msix_entry *msix_entries;
++	int nvectors;
++
++	bool		 enabled;
++
++} kvm_ivshmem_device;
++
++static int event_num;
++static struct semaphore sema;
++static wait_queue_head_t wait_queue;
++
++static bool inited_queue = false;
++
++static kvm_ivshmem_device kvm_ivshmem_dev;
++
++static int device_major_nr;
++
++static int kvm_ivshmem_mmap(struct file *, struct vm_area_struct *);
++static int kvm_ivshmem_open(struct inode *, struct file *);
++static int kvm_ivshmem_release(struct inode *, struct file *);
++static ssize_t kvm_ivshmem_read(struct file *, char *, size_t, loff_t *);
++static ssize_t kvm_ivshmem_write(struct file *, const char *, size_t, loff_t *);
++static loff_t kvm_ivshmem_lseek(struct file * filp, loff_t offset, int origin);
++
++enum ivshmem_ioctl { set_sema, down_sema, empty, wait_event, wait_event_irq, read_ivposn, read_livelist, sema_irq };
++
++static unsigned long lock_owner_offset = sizeof(rr_event_guest_queue_header);
++static unsigned long vcpu_inst_cnt_offset = sizeof(rr_event_guest_queue_header) + sizeof(unsigned long);
++
++static const struct file_operations kvm_ivshmem_ops = {
++	.owner   = THIS_MODULE,
++	.open	= kvm_ivshmem_open,
++	.mmap	= kvm_ivshmem_mmap,
++	.read	= kvm_ivshmem_read,
++	.write   = kvm_ivshmem_write,
++	.llseek  = kvm_ivshmem_lseek,
++	.release = kvm_ivshmem_release,
++};
++
++static struct pci_device_id kvm_ivshmem_id_table[] = {
++	{ 0x1af4, 0x1110, PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
++	{ 0 },
++};
++MODULE_DEVICE_TABLE (pci, kvm_ivshmem_id_table);
++
++static void kvm_ivshmem_remove_device(struct pci_dev* pdev);
++static int kvm_ivshmem_probe_device (struct pci_dev *pdev,
++						const struct pci_device_id * ent);
++
++static struct pci_driver kvm_ivshmem_pci_driver = {
++	.name		= "kvm-shmem",
++	.id_table	= kvm_ivshmem_id_table,
++	.probe	   = kvm_ivshmem_probe_device,
++	.remove	  = kvm_ivshmem_remove_device,
++};
++
++
++static ssize_t kvm_ivshmem_read(struct file * filp, char * buffer, size_t len,
++						loff_t * poffset)
++{
++
++	int bytes_read = 0;
++	unsigned long offset;
++
++	offset = *poffset;
++
++	if (!kvm_ivshmem_dev.base_addr) {
++		printk(KERN_ERR "KVM_IVSHMEM: cannot read from ioaddr (NULL)\n");
++		return 0;
++	}
++
++	if (len > kvm_ivshmem_dev.ioaddr_size - offset) {
++		len = kvm_ivshmem_dev.ioaddr_size - offset;
++	}
++
++	if (len == 0) return 0;
++
++	bytes_read = copy_to_user(buffer, kvm_ivshmem_dev.base_addr+offset, len);
++	if (bytes_read > 0) {
++		return -EFAULT;
++	}
++
++	*poffset += len;
++	return len;
++}
++
++static loff_t kvm_ivshmem_lseek(struct file * filp, loff_t offset, int origin)
++{
++
++	loff_t retval = -1;
++
++	switch (origin) {
++		case 1:
++			offset += filp->f_pos;
++            break;
++		case 0:
++			retval = offset;
++			if (offset > kvm_ivshmem_dev.ioaddr_size) {
++				offset = kvm_ivshmem_dev.ioaddr_size;
++			}
++			filp->f_pos = offset;
++	}
++
++	return retval;
++}
++
++static ssize_t kvm_ivshmem_write(struct file * filp, const char * buffer,
++					size_t len, loff_t * poffset)
++{
++
++	int bytes_written = 0;
++	unsigned long offset;
++
++	offset = *poffset;
++
++//	printk(KERN_INFO "KVM_IVSHMEM: trying to write\n");
++	if (!kvm_ivshmem_dev.base_addr) {
++		printk(KERN_ERR "KVM_IVSHMEM: cannot write to ioaddr (NULL)\n");
++		return 0;
++	}
++
++	if (len > kvm_ivshmem_dev.ioaddr_size - offset) {
++		len = kvm_ivshmem_dev.ioaddr_size - offset;
++	}
++
++//	printk(KERN_INFO "KVM_IVSHMEM: len is %u\n", (unsigned) len);
++	if (len == 0) return 0;
++
++	bytes_written = copy_from_user(kvm_ivshmem_dev.base_addr+offset,
++					buffer, len);
++	if (bytes_written > 0) {
++		return -EFAULT;
++	}
++
++//	printk(KERN_INFO "KVM_IVSHMEM: wrote %u bytes at offset %lu\n", (unsigned) len, offset);
++	*poffset += len;
++	return len;
++}
++
++static irqreturn_t kvm_ivshmem_interrupt (int irq, void *dev_instance)
++{
++	struct kvm_ivshmem_device * dev = dev_instance;
++	u32 status;
++
++	if (unlikely(dev == NULL))
++		return IRQ_NONE;
++
++	status = readl(dev->regs + IntrStatus);
++	if (!status || (status == 0xFFFFFFFF))
++		return IRQ_NONE;
++
++	/* depending on the message we wake different structures */
++	if (status == sema_irq) {
++		up(&sema);
++	} else if (status == wait_event_irq) {
++		event_num = 1;
++		wake_up_interruptible(&wait_queue);
++	}
++
++	printk(KERN_INFO "KVM_IVSHMEM: interrupt (status = 0x%04x)\n",
++		   status);
++
++	return IRQ_HANDLED;
++}
++
++__maybe_unused static int request_msix_vectors(struct kvm_ivshmem_device *ivs_info, int nvectors)
++{
++	int i, err;
++	const char *name = "ivshmem";
++
++	printk(KERN_INFO "devname is %s\n", name);
++	ivs_info->nvectors = nvectors;
++
++
++	ivs_info->msix_entries = kmalloc(nvectors * sizeof *ivs_info->msix_entries,
++					   GFP_KERNEL);
++	ivs_info->msix_names = kmalloc(nvectors * sizeof *ivs_info->msix_names,
++					 GFP_KERNEL);
++
++	for (i = 0; i < nvectors; ++i)
++		ivs_info->msix_entries[i].entry = i;
++		
++	err = pci_enable_msix_range(ivs_info->dev, ivs_info->msix_entries, 0, ivs_info->nvectors);
++	if (err > 0) {
++		printk(KERN_INFO "no MSI. Back to INTx.\n");
++		return -ENOSPC;
++	}
++
++	if (err) {
++		printk(KERN_INFO "some error below zero %d\n", err);
++		return err;
++	}
++
++	for (i = 0; i < nvectors; i++) {
++
++		snprintf(ivs_info->msix_names[i], sizeof *ivs_info->msix_names,
++		 "%s-config", name);
++
++		err = request_irq(ivs_info->msix_entries[i].vector,
++				  kvm_ivshmem_interrupt, 0,
++				  ivs_info->msix_names[i], ivs_info);
++
++		if (err) {
++			printk(KERN_INFO "couldn't allocate irq for msi-x entry %d with vector %d\n", i, ivs_info->msix_entries[i].vector);
++			return -ENOSPC;
++		}
++	}
++
++	return 0;
++}
++
++static int kvm_ivshmem_probe_device (struct pci_dev *pdev,
++					const struct pci_device_id * ent) {
++
++	int result;
++
++	printk("KVM_IVSHMEM: Probing for KVM_IVSHMEM Device\n");
++
++	result = pci_enable_device(pdev);
++	if (result) {
++		printk(KERN_ERR "Cannot probe KVM_IVSHMEM device %s: error %d\n",
++		pci_name(pdev), result);
++		return result;
++	}
++
++	result = pci_request_regions(pdev, "kvm_ivshmem");
++	if (result < 0) {
++		printk(KERN_ERR "KVM_IVSHMEM: cannot request regions\n");
++		goto pci_disable;
++	} else printk(KERN_ERR "KVM_IVSHMEM: result is %d\n", result);
++
++	kvm_ivshmem_dev.ioaddr = pci_resource_start(pdev, 2);
++	kvm_ivshmem_dev.ioaddr_size = pci_resource_len(pdev, 2);
++
++	kvm_ivshmem_dev.base_addr = pci_iomap(pdev, 2, 0);
++	printk(KERN_INFO "KVM_IVSHMEM: iomap base = 0x%lx \n",
++							(unsigned long) kvm_ivshmem_dev.base_addr);
++
++	if (!kvm_ivshmem_dev.base_addr) {
++		printk(KERN_ERR "KVM_IVSHMEM: cannot iomap region of size %lu\n",
++							kvm_ivshmem_dev.ioaddr_size);
++		goto pci_release;
++	}
++
++	printk(KERN_INFO "KVM_IVSHMEM: ioaddr = %x ioaddr_size = %lu\n",
++						kvm_ivshmem_dev.ioaddr, kvm_ivshmem_dev.ioaddr_size);
++
++	kvm_ivshmem_dev.regaddr =  pci_resource_start(pdev, 0);
++	kvm_ivshmem_dev.reg_size = pci_resource_len(pdev, 0);
++	kvm_ivshmem_dev.regs = pci_iomap(pdev, 0, 0x100);
++
++	kvm_ivshmem_dev.dev = pdev;
++
++	if (!kvm_ivshmem_dev.regs) {
++		printk(KERN_ERR "KVM_IVSHMEM: cannot ioremap registers of size %d\n",
++							kvm_ivshmem_dev.reg_size);
++		goto reg_release;
++	}
++
++	/* set all masks to on */
++	writel(0xffffffff, kvm_ivshmem_dev.regs + IntrMask);
++
++	/* by default initialize semaphore to 0 */
++	sema_init(&sema, 0);
++
++	init_waitqueue_head(&wait_queue);
++	event_num = 0;
++
++	// if (request_msix_vectors(&kvm_ivshmem_dev, 4) != 0) {
++	// 	printk(KERN_INFO "regular IRQs\n");
++	// 	if (request_irq(pdev->irq, kvm_ivshmem_interrupt, IRQF_SHARED,
++	// 						"kvm_ivshmem", &kvm_ivshmem_dev)) {
++	// 		printk(KERN_ERR "KVM_IVSHMEM: cannot get interrupt %d\n", pdev->irq);
++	// 		printk(KERN_INFO "KVM_IVSHMEM: irq = %u regaddr = %x reg_size = %d\n",
++	// 				pdev->irq, kvm_ivshmem_dev.regaddr, kvm_ivshmem_dev.reg_size);
++	// 	}
++	// } else {
++	// 	printk(KERN_INFO "MSI-X enabled\n");
++	// }
++
++	return 0;
++
++
++reg_release:
++	pci_iounmap(pdev, kvm_ivshmem_dev.base_addr);
++pci_release:
++	pci_release_regions(pdev);
++pci_disable:
++	pci_disable_device(pdev);
++	return -EBUSY;
++
++}
++
++static void kvm_ivshmem_remove_device(struct pci_dev* pdev)
++{
++
++	printk(KERN_INFO "Unregister kvm_ivshmem device.\n");
++	free_irq(pdev->irq,&kvm_ivshmem_dev);
++	pci_iounmap(pdev, kvm_ivshmem_dev.regs);
++	pci_iounmap(pdev, kvm_ivshmem_dev.base_addr);
++	pci_release_regions(pdev);
++	pci_disable_device(pdev);
++
++}
++
++static void __exit kvm_ivshmem_cleanup_module (void)
++{
++	pci_unregister_driver (&kvm_ivshmem_pci_driver);
++	unregister_chrdev(device_major_nr, "kvm_ivshmem");
++}
++
++
++static int kvm_ivshmem_open(struct inode * inode, struct file * filp)
++{
++
++   printk(KERN_INFO "Opening kvm_ivshmem device\n");
++
++   if (MINOR(inode->i_rdev) != KVM_IVSHMEM_DEVICE_MINOR_NUM) {
++	  printk(KERN_INFO "minor number is %d\n", KVM_IVSHMEM_DEVICE_MINOR_NUM);
++	  return -ENODEV;
++   }
++
++   return 0;
++}
++
++static int kvm_ivshmem_release(struct inode * inode, struct file * filp)
++{
++
++   return 0;
++}
++
++static int kvm_ivshmem_mmap(struct file *filp, struct vm_area_struct * vma)
++{
++
++	unsigned long len;
++	unsigned long off;
++	unsigned long start;
++
++	// lock_kernel();
++
++
++	off = vma->vm_pgoff << PAGE_SHIFT;
++	start = kvm_ivshmem_dev.ioaddr;
++
++	len=PAGE_ALIGN((start & ~PAGE_MASK) + kvm_ivshmem_dev.ioaddr_size);
++	start &= PAGE_MASK;
++
++	printk(KERN_INFO "%lu - %lu + %lu\n",vma->vm_end ,vma->vm_start, off);
++	printk(KERN_INFO "%lu > %lu\n",(vma->vm_end - vma->vm_start + off), len);
++
++	if ((vma->vm_end - vma->vm_start + off) > len) {
++		// unlock_kernel();
++		return -EINVAL;
++	}
++
++	off += start;
++	vma->vm_pgoff = off >> PAGE_SHIFT;
++
++	vma->vm_flags |= (VM_SHARED| VM_DONTEXPAND | VM_DONTDUMP);
++
++	if(io_remap_pfn_range(vma, vma->vm_start,
++		off >> PAGE_SHIFT, vma->vm_end - vma->vm_start,
++		vma->vm_page_prot))
++	{
++		printk("mmap failed\n");
++		// unlock_kernel();
++		return -ENXIO;
++	}
++	// unlock_kernel();
++
++	return 0;
++}
++
++rr_event_log_guest* rr_get_tail_event(void)
++{
++    rr_event_log_guest *event;
++    rr_event_guest_queue_header *header;
++
++    header = (rr_event_guest_queue_header *)kvm_ivshmem_dev.base_addr;
++
++    if (header->current_pos == 0) {
++        return NULL;
++    }
++
++    event = (rr_event_log_guest *)(kvm_ivshmem_dev.base_addr + header->header_size + \
++                                   (header->current_pos - 1) * header->entry_size);
++
++    return event;    
++}
++
++void *rr_alloc_new_event_entry(unsigned long size, int type)
++{
++    rr_event_guest_queue_header *header;
++    rr_event_log_guest *entry;
++	rr_event_entry_header *entry_header;
++	unsigned long offset;
++	unsigned long event_size = size + sizeof(rr_event_entry_header);
++
++    header = (rr_event_guest_queue_header *)kvm_ivshmem_dev.base_addr;
++
++    if (header->current_byte + event_size >= header->total_size) {
++        kvm_hypercall0(102);
++        // printk(KERN_ERR "RR queue is full, start over\n");
++		// header->rotated_bytes += header->current_byte;
++        // header->current_byte = header->header_size;
++		// header->current_pos = 0;
++    }
++
++	offset = (unsigned long)kvm_ivshmem_dev.base_addr + header->current_byte;
++
++	entry_header = (rr_event_entry_header *)offset;
++
++	entry_header->type = type;
++
++    entry = (void *)(offset + sizeof(rr_event_entry_header));
++
++    header->current_pos++;
++	header->current_byte += event_size;
++
++    return entry;
++}
++
++void rr_set_lock_owner(int owner)
++{
++	atomic_set(kvm_ivshmem_dev.base_addr + lock_owner_offset, owner);
++}
++
++
++rr_interrupt *rr_get_cpu_intr_info(int cpu_id)
++{
++	return (rr_interrupt *)(kvm_ivshmem_dev.base_addr + vcpu_inst_cnt_offset + sizeof(rr_interrupt) * cpu_id);
++}
++
++static void rr_warmup_shared_memory(unsigned long total_size)
++{
++	unsigned long allocated_size = 0;
++	rr_event_guest_queue_header *header;
++
++	while (allocated_size < total_size) {
++		header = (rr_event_guest_queue_header *)(kvm_ivshmem_dev.base_addr + allocated_size);
++		header->total_size = total_size;
++		allocated_size += PAGE_SIZE;
++	}
++
++	printk(KERN_INFO "warmup memory %lu", allocated_size);
++}
++
++void rr_append_to_queue(rr_event_log_guest *event_log)
++{
++    rr_event_guest_queue_header *header;
++
++    header = (rr_event_guest_queue_header *)kvm_ivshmem_dev.base_addr;
++
++    event_log->id = header->current_pos;
++
++    memcpy(kvm_ivshmem_dev.base_addr + header->header_size + header->current_pos * header->entry_size,
++           event_log, sizeof(rr_event_log_guest));
++
++    header->current_pos++;
++
++    return;
++}
++
++int rr_enabled(void)
++{
++    rr_event_guest_queue_header *header;
++    header = (rr_event_guest_queue_header *)kvm_ivshmem_dev.base_addr;
++
++    return header->rr_enabled;
++}
++
++static void rr_init_queue(void)
++{
++    rr_event_guest_queue_header header = {
++        .header_size = 2 * PAGE_SIZE,
++        .entry_size = 2 * PAGE_SIZE,
++        .rr_enabled = 0,
++		.rotated_bytes = 0,
++    };
++    rr_event_log_guest *event;
++	unsigned long size;
++
++    event = kmalloc(sizeof(rr_event_log_guest), GFP_KERNEL);
++    event->type = 4;
++
++	header.current_pos = 0;
++	size = kvm_ivshmem_dev.ioaddr_size - header.header_size;
++    header.total_pos = size / header.entry_size;
++	header.total_size = size;
++
++	if (header.entry_size < sizeof(rr_event_log_guest)) {
++		panic("Entry size %u is smaller than required log size %ld",
++			  header.entry_size, sizeof(rr_event_log_guest));
++	}
++
++    printk(KERN_INFO "Initialized RR shared memory, "
++          "total size=%lu header size=%d, current pos=%d, total_pos=%d\n", 
++          size, header.header_size, header.current_pos, header.total_pos);
++
++    memcpy(kvm_ivshmem_dev.base_addr, &header, sizeof(rr_event_guest_queue_header));
++
++	// Warmup to touch shared memory
++	rr_warmup_shared_memory(header.total_size);
++
++	header.current_byte = header.header_size;
++
++	memcpy(kvm_ivshmem_dev.base_addr, &header, sizeof(rr_event_guest_queue_header));
++
++    inited_queue = true;
++    return;
++}
++
++bool rr_queue_inited(void)
++{
++    return inited_queue;
++}
++
++int __init kvm_ivshmem_init(void)
++{
++
++	int err = -ENOMEM;
++    printk(KERN_INFO "Init ivshmem\n");
++
++	/* Register device node ops. */
++	err = register_chrdev(0, "kvm_ivshmem", &kvm_ivshmem_ops);
++	if (err < 0) {
++		printk(KERN_ERR "Unable to register kvm_ivshmem device\n");
++		return err;
++	}
++	device_major_nr = err;
++	printk("KVM_IVSHMEM: Major device number is: %d\n", device_major_nr);
++	kvm_ivshmem_dev.enabled=FALSE;
++
++	err = pci_register_driver(&kvm_ivshmem_pci_driver);
++	if (err < 0) {
++		goto error;
++	}
++
++    // test_mem();
++
++    rr_init_queue();
++
++	return 0;
++
++error:
++	unregister_chrdev(device_major_nr, "kvm_ivshmem");
++    // return;
++	return err;
++}
+diff --git a/arch/x86/kernel/rr_serialize.c b/arch/x86/kernel/rr_serialize.c
+new file mode 100644
+index 000000000..3323641ca
+--- /dev/null
++++ b/arch/x86/kernel/rr_serialize.c
+@@ -0,0 +1,148 @@
++#include <linux/list.h>
++#include <linux/spinlock.h>
++#include <linux/kernel.h> // For printk
++#include <linux/smp.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/kvm_para.h>
++
++#include <asm/processor.h>
++#include <asm/msr-index.h>
++#include <linux/sched/task_stack.h>
++
++
++static int initialized = 0;
++volatile unsigned long lock = 0;
++static atomic_t current_owner;
++int skip_lock = 0;
++
++/*
++ * Reads performance monitoring counter using RDPMC instruction
++ * Returns: 64-bit counter value
++ */
++static inline unsigned long long read_pmc(int counter)
++{
++    unsigned low, high;
++    /*
++     * The RDPMC instruction reads the counter specified by the counter
++     * parameter into the EDX:EAX registers. The counter number needs to
++     * be loaded into the ECX register before the instruction is executed.
++     */
++    __asm__ volatile ("rdpmc" : "=a" (low), "=d" (high) : "c" (counter));
++    return ((unsigned long long)high << 32) | low;
++}
++
++/*
++ * Core lock acquisition with spinning and interrupt control
++ * Returns: spin count (>=0) on success, -1 if already owned by this CPU or skipped
++ */
++long rr_do_acquire_smp_exec(int disable_irq, int cpu_id, int ctx)
++{
++    unsigned long flags;
++    long spin_count = 0;
++
++    if (!initialized)
++        return -1;
++
++    if (skip_lock)
++        return -1;
++
++    // During spining the exec lock, disable the interrupt,
++    // because if we don't do it, there could be an interrupt
++    // while spinning, and the interrupt entry will repeatitively
++    // spin on this lock again.
++    if (disable_irq)
++        local_irq_save(flags);
++
++    if (atomic_read(&current_owner) == cpu_id){
++        spin_count = -1;
++        goto finish;
++    }
++
++    while (test_and_set_bit(0, &lock)) {
++        spin_count++;
++    }
++
++    atomic_set(&current_owner, cpu_id);
++    rr_set_lock_owner(cpu_id);
++
++    if (unlikely(ctx == CTX_LOCKWAIT))
++        kvm_hypercall1(KVM_INSTRUCTION_SYNC, spin_count);
++
++finish:
++    if (disable_irq)
++        local_irq_restore(flags);
++
++    return spin_count;
++}
++
++/*
++ * Initialize the SMP execution lock system
++ */
++void init_smp_exec_lock(void)
++{
++    atomic_set(&current_owner, -1);
++    initialized = 1;
++    if (num_online_cpus() == 1) {
++        skip_lock = 1;
++    }
++
++    printk(KERN_INFO "Initialized SMP exec lock, skip_lock=%d", skip_lock);
++}
++
++/*
++ * Acquire SMP execution lock with preemption control
++ * Returns: spin count on success, 0 if not initialized
++ */
++long rr_acquire_smp_exec(int ctx, int disable_irq)
++{
++    int cpu_id;
++    unsigned long spin_count;
++    // int cur;
++
++    if (!initialized)
++        return 0;
++
++    preempt_disable();
++    cpu_id = smp_processor_id();
++
++    spin_count = rr_do_acquire_smp_exec(disable_irq, cpu_id, ctx);
++
++    preempt_enable();
++
++    return spin_count;
++}
++
++/*
++ * Debug stub function - currently unused
++ */
++__maybe_unused void rr_bug(int expected, int cur) {
++};
++
++/*
++ * Release the SMP execution lock
++ */
++void rr_release_smp_exec(int ctx)
++{
++    unsigned long flags;
++    int cpu_id;
++
++    if (!initialized)
++        return;
++
++    if (skip_lock)
++        return;
++
++    local_irq_save(flags);
++
++    preempt_disable();
++    cpu_id = smp_processor_id();
++
++    atomic_set(&current_owner, -1);
++    rr_set_lock_owner(-1);
++
++    clear_bit(0, &lock);
++
++    preempt_enable();
++    local_irq_restore(flags);
++}
+diff --git a/arch/x86/kernel/traps.c b/arch/x86/kernel/traps.c
+index d3fdec706..5fbdf9585 100644
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@ -731,6 +731,8 @@ DEFINE_IDTENTRY_ERRORCODE(exc_general_protection)
+ 	enum kernel_gp_hint hint = GP_NO_HINT;
+ 	unsigned long gp_addr;
+ 
++	rr_handle_exception(regs, GP_VECTOR, error_code, 0);
++
+ 	if (user_mode(regs) && try_fixup_enqcmd_gp())
+ 		return;
+ 
+@@ -818,6 +820,11 @@ static void do_int3_user(struct pt_regs *regs)
+ 
+ DEFINE_IDTENTRY_RAW(exc_int3)
+ {
++
++	if (user_mode(regs)) {
++		rr_handle_exception(regs, BP_VECTOR, 0, 0);
++	}
++
+ 	/*
+ 	 * poke_int3_handler() is completely self contained code; it does (and
+ 	 * must) *NOT* call out to anything, lest it hits upon yet another
+@@ -1177,7 +1184,10 @@ DEFINE_IDTENTRY_DEBUG(exc_debug)
+ /* User entry, runs on regular task stack */
+ DEFINE_IDTENTRY_DEBUG_USER(exc_debug)
+ {
+-	exc_debug_user(regs, debug_read_clear_dr6());
++	unsigned long dr6 = debug_read_clear_dr6();
++
++	rr_handle_exception(regs, DB_VECTOR, 0, dr6);
++	exc_debug_user(regs, dr6);
+ }
+ #else
+ /* 32 bit does not have separate entry points. */
+@@ -1185,9 +1195,10 @@ DEFINE_IDTENTRY_RAW(exc_debug)
+ {
+ 	unsigned long dr6 = debug_read_clear_dr6();
+ 
+-	if (user_mode(regs))
++	if (user_mode(regs)) {
++		rr_handle_exception(regs, DB_VECTOR, 0, dr6);
+ 		exc_debug_user(regs, dr6);
+-	else
++	} else
+ 		exc_debug_kernel(regs, dr6);
+ }
+ #endif
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 7b0d4ab89..76d8129d6 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -1533,6 +1533,8 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+ 	unsigned long address = read_cr2();
+ 	irqentry_state_t state;
+ 
++	rr_handle_exception(regs, PF_VECTOR, error_code, address);
++
+ 	prefetchw(&current->mm->mmap_lock);
+ 
+ 	/*
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 8a74cdcc9..d26fdcb08 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -531,13 +531,14 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 	bool locked = !!(vma->vm_flags & VM_LOCKED);
+ 	struct page *page = NULL;
+ 	bool migration = false, young = false, dirty = false;
+-
+-	if (pte_present(*pte)) {
+-		page = vm_normal_page(vma, addr, *pte);
+-		young = pte_young(*pte);
+-		dirty = pte_dirty(*pte);
+-	} else if (is_swap_pte(*pte)) {
+-		swp_entry_t swpent = pte_to_swp_entry(*pte);
++	pte_t pte_val = rr_read_pte(pte);
++
++	if (pte_present(pte_val)) {
++		page = vm_normal_page(vma, addr, pte_val);
++		young = pte_young(pte_val);
++		dirty = pte_dirty(pte_val);
++	} else if (is_swap_pte(pte_val)) {
++		swp_entry_t swpent = pte_to_swp_entry(pte_val);
+ 
+ 		if (!non_swap_entry(swpent)) {
+ 			int mapcount;
+diff --git a/igb_uio/Kbuild b/igb_uio/Kbuild
+new file mode 100644
+index 000000000..3ab85c411
+--- /dev/null
++++ b/igb_uio/Kbuild
+@@ -0,0 +1,2 @@
++ccflags-y := $(MODULE_CFLAGS)
++obj-m := igb_uio.o
+diff --git a/igb_uio/Makefile b/igb_uio/Makefile
+new file mode 100644
+index 000000000..bd2e356c0
+--- /dev/null
++++ b/igb_uio/Makefile
+@@ -0,0 +1,7 @@
++KSRC ?= /lib/modules/$(shell uname -r)/build
++
++all:
++	make -C $(KSRC)/ M=$(CURDIR)
++
++%:
++	make -C $(KSRC)/ M=$(CURDIR) $@
+diff --git a/igb_uio/compat.h b/igb_uio/compat.h
+new file mode 100644
+index 000000000..71172f40c
+--- /dev/null
++++ b/igb_uio/compat.h
+@@ -0,0 +1,168 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Minimal wrappers to allow compiling igb_uio on older kernels.
++ */
++
++#ifndef RHEL_RELEASE_VERSION
++#define RHEL_RELEASE_VERSION(a, b) (((a) << 8) + (b))
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 3, 0)
++#define pci_cfg_access_lock   pci_block_user_cfg_access
++#define pci_cfg_access_unlock pci_unblock_user_cfg_access
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 18, 0)
++#define HAVE_PTE_MASK_PAGE_IOMAP
++#endif
++
++#ifndef PCI_MSIX_ENTRY_SIZE
++#define PCI_MSIX_ENTRY_SIZE            16
++#define PCI_MSIX_ENTRY_VECTOR_CTRL     12
++#define PCI_MSIX_ENTRY_CTRL_MASKBIT    1
++#endif
++
++/*
++ * for kernels < 2.6.38 and backported patch that moves MSI-X entry definition
++ * to pci_regs.h Those kernels has PCI_MSIX_ENTRY_SIZE defined but not
++ * PCI_MSIX_ENTRY_CTRL_MASKBIT
++ */
++#ifndef PCI_MSIX_ENTRY_CTRL_MASKBIT
++#define PCI_MSIX_ENTRY_CTRL_MASKBIT    1
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 34) && \
++	(!(defined(RHEL_RELEASE_CODE) && \
++	 RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(5, 9)))
++
++static int pci_num_vf(struct pci_dev *dev)
++{
++	struct iov {
++		int pos;
++		int nres;
++		u32 cap;
++		u16 ctrl;
++		u16 total;
++		u16 initial;
++		u16 nr_virtfn;
++	} *iov = (struct iov *)dev->sriov;
++
++	if (!dev->is_physfn)
++		return 0;
++
++	return iov->nr_virtfn;
++}
++
++#endif /* < 2.6.34 */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39) && \
++	(!(defined(RHEL_RELEASE_CODE) && \
++	   RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(6, 4)))
++
++#define kstrtoul strict_strtoul
++
++#endif /* < 2.6.39 */
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 3, 0) && \
++	(!(defined(RHEL_RELEASE_CODE) && \
++	   RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(6, 3)))
++
++/* Check if INTX works to control irq's.
++ * Set's INTX_DISABLE flag and reads it back
++ */
++static bool pci_intx_mask_supported(struct pci_dev *pdev)
++{
++	bool mask_supported = false;
++	uint16_t orig, new;
++
++	pci_block_user_cfg_access(pdev);
++	pci_read_config_word(pdev, PCI_COMMAND, &orig);
++	pci_write_config_word(pdev, PCI_COMMAND,
++			      orig ^ PCI_COMMAND_INTX_DISABLE);
++	pci_read_config_word(pdev, PCI_COMMAND, &new);
++
++	if ((new ^ orig) & ~PCI_COMMAND_INTX_DISABLE) {
++		dev_err(&pdev->dev, "Command register changed from "
++			"0x%x to 0x%x: driver or hardware bug?\n", orig, new);
++	} else if ((new ^ orig) & PCI_COMMAND_INTX_DISABLE) {
++		mask_supported = true;
++		pci_write_config_word(pdev, PCI_COMMAND, orig);
++	}
++	pci_unblock_user_cfg_access(pdev);
++
++	return mask_supported;
++}
++
++static bool pci_check_and_mask_intx(struct pci_dev *pdev)
++{
++	bool pending;
++	uint32_t status;
++
++	pci_block_user_cfg_access(pdev);
++	pci_read_config_dword(pdev, PCI_COMMAND, &status);
++
++	/* interrupt is not ours, goes to out */
++	pending = (((status >> 16) & PCI_STATUS_INTERRUPT) != 0);
++	if (pending) {
++		uint16_t old, new;
++
++		old = status;
++		if (status != 0)
++			new = old & (~PCI_COMMAND_INTX_DISABLE);
++		else
++			new = old | PCI_COMMAND_INTX_DISABLE;
++
++		if (old != new)
++			pci_write_config_word(pdev, PCI_COMMAND, new);
++	}
++	pci_unblock_user_cfg_access(pdev);
++
++	return pending;
++}
++
++#endif /* < 3.3.0 */
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 16, 0)
++#define HAVE_PCI_IS_BRIDGE_API 1
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 3, 0)
++#define HAVE_MSI_LIST_IN_GENERIC_DEVICE 1
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 5, 0)
++#define HAVE_PCI_MSI_MASK_IRQ 1
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 8, 0)
++#define HAVE_ALLOC_IRQ_VECTORS 1
++#endif
++
++static inline bool igbuio_kernel_is_locked_down(void)
++{
++#ifdef CONFIG_LOCK_DOWN_KERNEL
++#ifdef CONFIG_LOCK_DOWN_IN_EFI_SECURE_BOOT
++	return kernel_is_locked_down(NULL);
++#elif defined(CONFIG_EFI_SECURE_BOOT_LOCK_DOWN)
++	return kernel_is_locked_down();
++#else
++	return false;
++#endif
++#else
++	return false;
++#endif
++}
++
++#ifndef fallthrough
++
++#ifndef __has_attribute
++#define __has_attribute(x) 0
++#endif
++
++#if __has_attribute(__fallthrough__)
++#define fallthrough	__attribute__((__fallthrough__))
++#else
++#define fallthrough	do {} while (0)  /* fallthrough */
++#endif
++
++#endif
+diff --git a/igb_uio/igb_uio.c b/igb_uio/igb_uio.c
+new file mode 100644
+index 000000000..aea67dac4
+--- /dev/null
++++ b/igb_uio/igb_uio.c
+@@ -0,0 +1,668 @@
++// SPDX-License-Identifier: GPL-2.0
++/*-
++ * Copyright(c) 2010-2017 Intel Corporation. All rights reserved.
++ */
++
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/pci.h>
++#include <linux/uio_driver.h>
++#include <linux/io.h>
++#include <linux/irq.h>
++#include <linux/msi.h>
++#include <linux/version.h>
++#include <linux/slab.h>
++
++/**
++ * These enum and macro definitions are copied from the
++ * file rte_pci_dev_features.h
++ */
++enum rte_intr_mode {
++	RTE_INTR_MODE_NONE = 0,
++	RTE_INTR_MODE_LEGACY,
++	RTE_INTR_MODE_MSI,
++	RTE_INTR_MODE_MSIX
++};
++#define RTE_INTR_MODE_NONE_NAME "none"
++#define RTE_INTR_MODE_LEGACY_NAME "legacy"
++#define RTE_INTR_MODE_MSI_NAME "msi"
++#define RTE_INTR_MODE_MSIX_NAME "msix"
++
++
++#include "compat.h"
++
++/**
++ * A structure describing the private information for a uio device.
++ */
++struct rte_uio_pci_dev {
++	struct uio_info info;
++	struct pci_dev *pdev;
++	enum rte_intr_mode mode;
++	atomic_t refcnt;
++};
++
++static int wc_activate;
++static char *intr_mode;
++static enum rte_intr_mode igbuio_intr_mode_preferred = RTE_INTR_MODE_MSIX;
++/* sriov sysfs */
++static ssize_t
++show_max_vfs(struct device *dev, struct device_attribute *attr,
++	     char *buf)
++{
++	return snprintf(buf, 10, "%u\n", dev_num_vf(dev));
++}
++
++static ssize_t
++store_max_vfs(struct device *dev, struct device_attribute *attr,
++	      const char *buf, size_t count)
++{
++	int err = 0;
++	unsigned long max_vfs;
++	struct pci_dev *pdev = to_pci_dev(dev);
++
++	if (0 != kstrtoul(buf, 0, &max_vfs))
++		return -EINVAL;
++
++	if (0 == max_vfs)
++		pci_disable_sriov(pdev);
++	else if (0 == pci_num_vf(pdev))
++		err = pci_enable_sriov(pdev, max_vfs);
++	else /* do nothing if change max_vfs number */
++		err = -EINVAL;
++
++	return err ? err : count;
++}
++
++static DEVICE_ATTR(max_vfs, S_IRUGO | S_IWUSR, show_max_vfs, store_max_vfs);
++
++static struct attribute *dev_attrs[] = {
++	&dev_attr_max_vfs.attr,
++	NULL,
++};
++
++static const struct attribute_group dev_attr_grp = {
++	.attrs = dev_attrs,
++};
++
++#ifndef HAVE_PCI_MSI_MASK_IRQ
++/*
++ * It masks the msix on/off of generating MSI-X messages.
++ */
++static void
++igbuio_msix_mask_irq(struct msi_desc *desc, s32 state)
++{
++	u32 mask_bits = desc->masked;
++	unsigned int offset = desc->msi_attrib.entry_nr * PCI_MSIX_ENTRY_SIZE +
++						PCI_MSIX_ENTRY_VECTOR_CTRL;
++
++	if (state != 0)
++		mask_bits &= ~PCI_MSIX_ENTRY_CTRL_MASKBIT;
++	else
++		mask_bits |= PCI_MSIX_ENTRY_CTRL_MASKBIT;
++
++	if (mask_bits != desc->masked) {
++		writel(mask_bits, desc->mask_base + offset);
++		readl(desc->mask_base);
++		desc->masked = mask_bits;
++	}
++}
++
++/*
++ * It masks the msi on/off of generating MSI messages.
++ */
++static void
++igbuio_msi_mask_irq(struct pci_dev *pdev, struct msi_desc *desc, int32_t state)
++{
++	u32 mask_bits = desc->masked;
++	u32 offset = desc->irq - pdev->irq;
++	u32 mask = 1 << offset;
++
++	if (!desc->msi_attrib.maskbit)
++		return;
++
++	if (state != 0)
++		mask_bits &= ~mask;
++	else
++		mask_bits |= mask;
++
++	if (mask_bits != desc->masked) {
++		pci_write_config_dword(pdev, desc->mask_pos, mask_bits);
++		desc->masked = mask_bits;
++	}
++}
++
++static void
++igbuio_mask_irq(struct pci_dev *pdev, enum rte_intr_mode mode, s32 irq_state)
++{
++	struct msi_desc *desc;
++	struct list_head *msi_list;
++
++#ifdef HAVE_MSI_LIST_IN_GENERIC_DEVICE
++	msi_list = &pdev->dev.msi_list;
++#else
++	msi_list = &pdev->msi_list;
++#endif
++
++	if (mode == RTE_INTR_MODE_MSIX) {
++		list_for_each_entry(desc, msi_list, list)
++			igbuio_msix_mask_irq(desc, irq_state);
++	} else if (mode == RTE_INTR_MODE_MSI) {
++		list_for_each_entry(desc, msi_list, list)
++			igbuio_msi_mask_irq(pdev, desc, irq_state);
++	}
++}
++#endif
++
++/**
++ * This is the irqcontrol callback to be registered to uio_info.
++ * It can be used to disable/enable interrupt from user space processes.
++ *
++ * @param info
++ *  pointer to uio_info.
++ * @param irq_state
++ *  state value. 1 to enable interrupt, 0 to disable interrupt.
++ *
++ * @return
++ *  - On success, 0.
++ *  - On failure, a negative value.
++ */
++static int
++igbuio_pci_irqcontrol(struct uio_info *info, s32 irq_state)
++{
++	struct rte_uio_pci_dev *udev = info->priv;
++	struct pci_dev *pdev = udev->pdev;
++
++#ifdef HAVE_PCI_MSI_MASK_IRQ
++	struct irq_data *irq = irq_get_irq_data(udev->info.irq);
++#endif
++
++	pci_cfg_access_lock(pdev);
++
++	if (udev->mode == RTE_INTR_MODE_MSIX || udev->mode == RTE_INTR_MODE_MSI) {
++#ifdef HAVE_PCI_MSI_MASK_IRQ
++		if (irq_state == 1)
++			pci_msi_unmask_irq(irq);
++		else
++			pci_msi_mask_irq(irq);
++#else
++		igbuio_mask_irq(pdev, udev->mode, irq_state);
++#endif
++	}
++
++	if (udev->mode == RTE_INTR_MODE_LEGACY)
++		pci_intx(pdev, !!irq_state);
++
++	pci_cfg_access_unlock(pdev);
++
++	return 0;
++}
++
++/**
++ * This is interrupt handler which will check if the interrupt is for the right device.
++ * If yes, disable it here and will be enable later.
++ */
++static irqreturn_t
++igbuio_pci_irqhandler(int irq, void *dev_id)
++{
++	struct rte_uio_pci_dev *udev = (struct rte_uio_pci_dev *)dev_id;
++	struct uio_info *info = &udev->info;
++
++	/* Legacy mode need to mask in hardware */
++	if (udev->mode == RTE_INTR_MODE_LEGACY &&
++	    !pci_check_and_mask_intx(udev->pdev))
++		return IRQ_NONE;
++
++	uio_event_notify(info);
++
++	/* Message signal mode, no share IRQ and automasked */
++	return IRQ_HANDLED;
++}
++
++static int
++igbuio_pci_enable_interrupts(struct rte_uio_pci_dev *udev)
++{
++	int err = 0;
++#ifndef HAVE_ALLOC_IRQ_VECTORS
++	struct msix_entry msix_entry;
++#endif
++
++	switch (igbuio_intr_mode_preferred) {
++	case RTE_INTR_MODE_MSIX:
++		/* Only 1 msi-x vector needed */
++#ifndef HAVE_ALLOC_IRQ_VECTORS
++		msix_entry.entry = 0;
++		if (pci_enable_msix(udev->pdev, &msix_entry, 1) == 0) {
++			dev_dbg(&udev->pdev->dev, "using MSI-X");
++			udev->info.irq_flags = IRQF_NO_THREAD;
++			udev->info.irq = msix_entry.vector;
++			udev->mode = RTE_INTR_MODE_MSIX;
++			break;
++		}
++#else
++		if (pci_alloc_irq_vectors(udev->pdev, 1, 1, PCI_IRQ_MSIX) == 1) {
++			dev_dbg(&udev->pdev->dev, "using MSI-X");
++			udev->info.irq_flags = IRQF_NO_THREAD;
++			udev->info.irq = pci_irq_vector(udev->pdev, 0);
++			udev->mode = RTE_INTR_MODE_MSIX;
++			break;
++		}
++#endif
++
++	fallthrough;
++	case RTE_INTR_MODE_MSI:
++#ifndef HAVE_ALLOC_IRQ_VECTORS
++		if (pci_enable_msi(udev->pdev) == 0) {
++			dev_dbg(&udev->pdev->dev, "using MSI");
++			udev->info.irq_flags = IRQF_NO_THREAD;
++			udev->info.irq = udev->pdev->irq;
++			udev->mode = RTE_INTR_MODE_MSI;
++			break;
++		}
++#else
++		if (pci_alloc_irq_vectors(udev->pdev, 1, 1, PCI_IRQ_MSI) == 1) {
++			dev_dbg(&udev->pdev->dev, "using MSI");
++			udev->info.irq_flags = IRQF_NO_THREAD;
++			udev->info.irq = pci_irq_vector(udev->pdev, 0);
++			udev->mode = RTE_INTR_MODE_MSI;
++			break;
++		}
++#endif
++	fallthrough;
++	case RTE_INTR_MODE_LEGACY:
++		if (pci_intx_mask_supported(udev->pdev)) {
++			dev_dbg(&udev->pdev->dev, "using INTX");
++			udev->info.irq_flags = IRQF_SHARED | IRQF_NO_THREAD;
++			udev->info.irq = udev->pdev->irq;
++			udev->mode = RTE_INTR_MODE_LEGACY;
++			break;
++		}
++		dev_notice(&udev->pdev->dev, "PCI INTX mask not supported\n");
++	fallthrough;
++	case RTE_INTR_MODE_NONE:
++		udev->mode = RTE_INTR_MODE_NONE;
++		udev->info.irq = UIO_IRQ_NONE;
++		break;
++
++	default:
++		dev_err(&udev->pdev->dev, "invalid IRQ mode %u",
++			igbuio_intr_mode_preferred);
++		udev->info.irq = UIO_IRQ_NONE;
++		err = -EINVAL;
++	}
++
++	if (udev->info.irq != UIO_IRQ_NONE)
++		err = request_irq(udev->info.irq, igbuio_pci_irqhandler,
++				  udev->info.irq_flags, udev->info.name,
++				  udev);
++	dev_info(&udev->pdev->dev, "uio device registered with irq %ld\n",
++		 udev->info.irq);
++
++	return err;
++}
++
++static void
++igbuio_pci_disable_interrupts(struct rte_uio_pci_dev *udev)
++{
++	if (udev->info.irq) {
++		free_irq(udev->info.irq, udev);
++		udev->info.irq = 0;
++	}
++
++#ifndef HAVE_ALLOC_IRQ_VECTORS
++	if (udev->mode == RTE_INTR_MODE_MSIX)
++		pci_disable_msix(udev->pdev);
++	if (udev->mode == RTE_INTR_MODE_MSI)
++		pci_disable_msi(udev->pdev);
++#else
++	if (udev->mode == RTE_INTR_MODE_MSIX ||
++	    udev->mode == RTE_INTR_MODE_MSI)
++		pci_free_irq_vectors(udev->pdev);
++#endif
++}
++
++
++/**
++ * This gets called while opening uio device file.
++ */
++static int
++igbuio_pci_open(struct uio_info *info, struct inode *inode)
++{
++	struct rte_uio_pci_dev *udev = info->priv;
++	struct pci_dev *dev = udev->pdev;
++	int err;
++
++	if (atomic_inc_return(&udev->refcnt) != 1)
++		return 0;
++
++	/* set bus master, which was cleared by the reset function */
++	pci_set_master(dev);
++
++	/* enable interrupts */
++	err = igbuio_pci_enable_interrupts(udev);
++	if (err) {
++		atomic_dec(&udev->refcnt);
++		dev_err(&dev->dev, "Enable interrupt fails\n");
++	}
++	return err;
++}
++
++static int
++igbuio_pci_release(struct uio_info *info, struct inode *inode)
++{
++	struct rte_uio_pci_dev *udev = info->priv;
++	struct pci_dev *dev = udev->pdev;
++
++	if (atomic_dec_and_test(&udev->refcnt)) {
++		/* disable interrupts */
++		igbuio_pci_disable_interrupts(udev);
++
++		/* stop the device from further DMA */
++		pci_clear_master(dev);
++	}
++
++	return 0;
++}
++
++/* Remap pci resources described by bar #pci_bar in uio resource n. */
++static int
++igbuio_pci_setup_iomem(struct pci_dev *dev, struct uio_info *info,
++		       int n, int pci_bar, const char *name)
++{
++	unsigned long addr, len;
++	void *internal_addr;
++
++	if (n >= ARRAY_SIZE(info->mem))
++		return -EINVAL;
++
++	addr = pci_resource_start(dev, pci_bar);
++	len = pci_resource_len(dev, pci_bar);
++	if (addr == 0 || len == 0)
++		return -1;
++	if (wc_activate == 0) {
++		internal_addr = ioremap(addr, len);
++		if (internal_addr == NULL)
++			return -1;
++	} else {
++		internal_addr = NULL;
++	}
++	info->mem[n].name = name;
++	info->mem[n].addr = addr;
++	info->mem[n].internal_addr = internal_addr;
++	info->mem[n].size = len;
++	info->mem[n].memtype = UIO_MEM_PHYS;
++	return 0;
++}
++
++/* Get pci port io resources described by bar #pci_bar in uio resource n. */
++static int
++igbuio_pci_setup_ioport(struct pci_dev *dev, struct uio_info *info,
++		int n, int pci_bar, const char *name)
++{
++	unsigned long addr, len;
++
++	if (n >= ARRAY_SIZE(info->port))
++		return -EINVAL;
++
++	addr = pci_resource_start(dev, pci_bar);
++	len = pci_resource_len(dev, pci_bar);
++	if (addr == 0 || len == 0)
++		return -EINVAL;
++
++	info->port[n].name = name;
++	info->port[n].start = addr;
++	info->port[n].size = len;
++	info->port[n].porttype = UIO_PORT_X86;
++
++	return 0;
++}
++
++/* Unmap previously ioremap'd resources */
++static void
++igbuio_pci_release_iomem(struct uio_info *info)
++{
++	int i;
++
++	for (i = 0; i < MAX_UIO_MAPS; i++) {
++		if (info->mem[i].internal_addr)
++			iounmap(info->mem[i].internal_addr);
++	}
++}
++
++static int
++igbuio_setup_bars(struct pci_dev *dev, struct uio_info *info)
++{
++	int i, iom, iop, ret;
++	unsigned long flags;
++	static const char *bar_names[PCI_STD_RESOURCE_END + 1]  = {
++		"BAR0",
++		"BAR1",
++		"BAR2",
++		"BAR3",
++		"BAR4",
++		"BAR5",
++	};
++
++	iom = 0;
++	iop = 0;
++
++	for (i = 0; i < ARRAY_SIZE(bar_names); i++) {
++		if (pci_resource_len(dev, i) != 0 &&
++				pci_resource_start(dev, i) != 0) {
++			flags = pci_resource_flags(dev, i);
++			if (flags & IORESOURCE_MEM) {
++				ret = igbuio_pci_setup_iomem(dev, info, iom,
++							     i, bar_names[i]);
++				if (ret != 0)
++					return ret;
++				iom++;
++			} else if (flags & IORESOURCE_IO) {
++				ret = igbuio_pci_setup_ioport(dev, info, iop,
++							      i, bar_names[i]);
++				if (ret != 0)
++					return ret;
++				iop++;
++			}
++		}
++	}
++
++	return (iom != 0 || iop != 0) ? ret : -ENOENT;
++}
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 8, 0)
++static int __devinit
++#else
++static int
++#endif
++igbuio_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
++{
++	struct rte_uio_pci_dev *udev;
++	dma_addr_t map_dma_addr;
++	void *map_addr;
++	int err;
++
++#ifdef HAVE_PCI_IS_BRIDGE_API
++	if (pci_is_bridge(dev)) {
++		dev_warn(&dev->dev, "Ignoring PCI bridge device\n");
++		return -ENODEV;
++	}
++#endif
++
++	udev = kzalloc(sizeof(struct rte_uio_pci_dev), GFP_KERNEL);
++	if (!udev)
++		return -ENOMEM;
++
++	/*
++	 * enable device: ask low-level code to enable I/O and
++	 * memory
++	 */
++	err = pci_enable_device(dev);
++	if (err != 0) {
++		dev_err(&dev->dev, "Cannot enable PCI device\n");
++		goto fail_free;
++	}
++
++	/* enable bus mastering on the device */
++	pci_set_master(dev);
++
++	/* remap IO memory */
++	err = igbuio_setup_bars(dev, &udev->info);
++	if (err != 0)
++		goto fail_release_iomem;
++
++	/* set 64-bit DMA mask */
++	err = dma_set_mask_and_coherent(&dev->dev,  DMA_BIT_MASK(64));
++	if (err != 0) {
++		dev_err(&dev->dev, "Cannot set DMA mask\n");
++		goto fail_release_iomem;
++	}
++
++	/* fill uio infos */
++	udev->info.name = "igb_uio";
++	udev->info.version = "0.1";
++	udev->info.irqcontrol = igbuio_pci_irqcontrol;
++	udev->info.open = igbuio_pci_open;
++	udev->info.release = igbuio_pci_release;
++	udev->info.priv = udev;
++	udev->pdev = dev;
++	atomic_set(&udev->refcnt, 0);
++
++	err = sysfs_create_group(&dev->dev.kobj, &dev_attr_grp);
++	if (err != 0)
++		goto fail_release_iomem;
++
++	/* register uio driver */
++	err = uio_register_device(&dev->dev, &udev->info);
++	if (err != 0)
++		goto fail_remove_group;
++
++	pci_set_drvdata(dev, udev);
++
++	/*
++	 * Doing a harmless dma mapping for attaching the device to
++	 * the iommu identity mapping if kernel boots with iommu=pt.
++	 * Note this is not a problem if no IOMMU at all.
++	 */
++	map_addr = dma_alloc_coherent(&dev->dev, 1024, &map_dma_addr,
++			GFP_KERNEL);
++	if (map_addr)
++		memset(map_addr, 0, 1024);
++
++	if (!map_addr)
++		dev_info(&dev->dev, "dma mapping failed\n");
++	else {
++		dev_info(&dev->dev, "mapping 1K dma=%#llx host=%p\n",
++			 (unsigned long long)map_dma_addr, map_addr);
++
++		dma_free_coherent(&dev->dev, 1024, map_addr, map_dma_addr);
++		dev_info(&dev->dev, "unmapping 1K dma=%#llx host=%p\n",
++			 (unsigned long long)map_dma_addr, map_addr);
++	}
++
++	return 0;
++
++fail_remove_group:
++	sysfs_remove_group(&dev->dev.kobj, &dev_attr_grp);
++fail_release_iomem:
++	igbuio_pci_release_iomem(&udev->info);
++	pci_disable_device(dev);
++fail_free:
++	kfree(udev);
++
++	return err;
++}
++
++static void
++igbuio_pci_remove(struct pci_dev *dev)
++{
++	struct rte_uio_pci_dev *udev = pci_get_drvdata(dev);
++
++	igbuio_pci_release(&udev->info, NULL);
++
++	sysfs_remove_group(&dev->dev.kobj, &dev_attr_grp);
++	uio_unregister_device(&udev->info);
++	igbuio_pci_release_iomem(&udev->info);
++	pci_disable_device(dev);
++	pci_set_drvdata(dev, NULL);
++	kfree(udev);
++}
++
++static int
++igbuio_config_intr_mode(char *intr_str)
++{
++	if (!intr_str) {
++		pr_info("Use MSIX interrupt by default\n");
++		return 0;
++	}
++
++	if (!strcmp(intr_str, RTE_INTR_MODE_MSIX_NAME)) {
++		igbuio_intr_mode_preferred = RTE_INTR_MODE_MSIX;
++		pr_info("Use MSIX interrupt\n");
++	} else if (!strcmp(intr_str, RTE_INTR_MODE_MSI_NAME)) {
++		igbuio_intr_mode_preferred = RTE_INTR_MODE_MSI;
++		pr_info("Use MSI interrupt\n");
++	} else if (!strcmp(intr_str, RTE_INTR_MODE_LEGACY_NAME)) {
++		igbuio_intr_mode_preferred = RTE_INTR_MODE_LEGACY;
++		pr_info("Use legacy interrupt\n");
++	} else {
++		pr_info("Error: bad parameter - %s\n", intr_str);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static struct pci_driver igbuio_pci_driver = {
++	.name = "igb_uio",
++	.id_table = NULL,
++	.probe = igbuio_pci_probe,
++	.remove = igbuio_pci_remove,
++};
++
++static int __init
++igbuio_pci_init_module(void)
++{
++	int ret;
++
++	if (igbuio_kernel_is_locked_down()) {
++		pr_err("Not able to use module, kernel lock down is enabled\n");
++		return -EINVAL;
++	}
++
++	if (wc_activate != 0)
++		pr_info("wc_activate is set\n");
++
++	ret = igbuio_config_intr_mode(intr_mode);
++	if (ret < 0)
++		return ret;
++
++	return pci_register_driver(&igbuio_pci_driver);
++}
++
++static void __exit
++igbuio_pci_exit_module(void)
++{
++	pci_unregister_driver(&igbuio_pci_driver);
++}
++
++module_init(igbuio_pci_init_module);
++module_exit(igbuio_pci_exit_module);
++
++module_param(intr_mode, charp, S_IRUGO);
++MODULE_PARM_DESC(intr_mode,
++"igb_uio interrupt mode (default=msix):\n"
++"    " RTE_INTR_MODE_MSIX_NAME "       Use MSIX interrupt\n"
++"    " RTE_INTR_MODE_MSI_NAME "        Use MSI interrupt\n"
++"    " RTE_INTR_MODE_LEGACY_NAME "     Use Legacy interrupt\n"
++"\n");
++
++module_param(wc_activate, int, 0);
++MODULE_PARM_DESC(wc_activate,
++"Activate support for write combining (WC) (default=0)\n"
++"    0 - disable\n"
++"    other - enable\n");
++
++MODULE_DESCRIPTION("UIO driver for Intel IGB PCI cards");
++MODULE_LICENSE("GPL");
++MODULE_AUTHOR("Intel Corporation");
+diff --git a/igb_uio/meson.build b/igb_uio/meson.build
+new file mode 100644
+index 000000000..f6e04d585
+--- /dev/null
++++ b/igb_uio/meson.build
+@@ -0,0 +1,20 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# Copyright(c) 2017 Intel Corporation
++
++mkfile = custom_target('igb_uio_makefile',
++        output: 'Makefile',
++        command: ['touch', '@OUTPUT@'])
++
++custom_target('igb_uio',
++        input: ['igb_uio.c', 'Kbuild'],
++        output: 'igb_uio.ko',
++        command: ['make', '-C', kernel_build_dir,
++                'M=' + meson.current_build_dir(),
++                'src=' + meson.current_source_dir(),
++                'EXTRA_CFLAGS=-I' + meson.current_source_dir() +
++                        '/../../../lib/librte_eal/include',
++                'modules'],
++        depends: mkfile,
++        install: true,
++        install_dir: kernel_build_dir + '/extra/dpdk',
++        build_by_default: get_option('enable_kmods'))
+diff --git a/include/asm-generic/qspinlock.h b/include/asm-generic/qspinlock.h
+index 995513fa2..1d87c64d7 100644
+--- a/include/asm-generic/qspinlock.h
++++ b/include/asm-generic/qspinlock.h
+@@ -41,6 +41,7 @@
+ 
+ #include <asm-generic/qspinlock_types.h>
+ #include <linux/atomic.h>
++#include <asm/kernel_rr.h>
+ 
+ #ifndef queued_spin_is_locked
+ /**
+@@ -111,7 +112,9 @@ static __always_inline void queued_spin_lock(struct qspinlock *lock)
+ 	if (likely(atomic_try_cmpxchg_acquire(&lock->val, &val, _Q_LOCKED_VAL)))
+ 		return;
+ 
++	rr_release_smp_exec(CTX_LOCKWAIT);
+ 	queued_spin_lock_slowpath(lock, val);
++	rr_acquire_smp_exec(CTX_LOCKWAIT, true);
+ }
+ #endif
+ 
+diff --git a/include/linux/highmem-internal.h b/include/linux/highmem-internal.h
+index 034b1106d..b68db42c3 100644
+--- a/include/linux/highmem-internal.h
++++ b/include/linux/highmem-internal.h
+@@ -21,6 +21,8 @@ static inline void kmap_local_fork(struct task_struct *tsk) { }
+ static inline void kmap_assert_nomap(void) { }
+ #endif
+ 
++void *rr_record_page_map(struct page *p, void *addr);
++
+ #ifdef CONFIG_HIGHMEM
+ #include <asm/highmem.h>
+ 
+@@ -179,7 +181,11 @@ static inline void kunmap(struct page *page)
+ 
+ static inline void *kmap_local_page(struct page *page)
+ {
+-	return page_address(page);
++	if (!PageAnon(page)) {
++        return page_address(page);
++    }
++
++	return rr_record_page_map(page, page_address(page));
+ }
+ 
+ static inline void *kmap_local_folio(struct folio *folio, size_t offset)
+diff --git a/include/linux/kernel.h b/include/linux/kernel.h
+index fe6efb24d..ff95be48d 100644
+--- a/include/linux/kernel.h
++++ b/include/linux/kernel.h
+@@ -508,4 +508,7 @@ static inline void ftrace_dump(enum ftrace_dump_mode oops_dump_mode) { }
+ 	 /* OTHER_WRITABLE?  Generally considered a bad idea. */		\
+ 	 BUILD_BUG_ON_ZERO((perms) & 2) +					\
+ 	 (perms))
++
++int __init kvm_ivshmem_init(void);
++
+ #endif
+diff --git a/include/linux/pgtable.h b/include/linux/pgtable.h
+index a108b60a6..34f25be42 100644
+--- a/include/linux/pgtable.h
++++ b/include/linux/pgtable.h
+@@ -294,7 +294,7 @@ static inline void ptep_clear(struct mm_struct *mm, unsigned long addr,
+ #ifndef __HAVE_ARCH_PTEP_GET
+ static inline pte_t ptep_get(pte_t *ptep)
+ {
+-	return READ_ONCE(*ptep);
++	return rr_read_pte_once(ptep);
+ }
+ #endif
+ 
+diff --git a/include/linux/uaccess.h b/include/linux/uaccess.h
+index afb18f198..fa42140bd 100644
+--- a/include/linux/uaccess.h
++++ b/include/linux/uaccess.h
+@@ -9,6 +9,7 @@
+ #include <linux/thread_info.h>
+ 
+ #include <asm/uaccess.h>
++#include <asm/kernel_rr.h>
+ 
+ /*
+  * Architectures should provide two primitives (raw_copy_{to,from}_user())
+@@ -62,7 +63,9 @@ __copy_from_user_inatomic(void *to, const void __user *from, unsigned long n)
+ 
+ 	instrument_copy_from_user_before(to, from, n);
+ 	check_object_size(to, n, false);
++
+ 	res = raw_copy_from_user(to, from, n);
++
+ 	instrument_copy_from_user_after(to, from, n, res);
+ 	return res;
+ }
+@@ -77,7 +80,9 @@ __copy_from_user(void *to, const void __user *from, unsigned long n)
+ 	if (should_fail_usercopy())
+ 		return n;
+ 	check_object_size(to, n, false);
++
+ 	res = raw_copy_from_user(to, from, n);
++
+ 	instrument_copy_from_user_after(to, from, n, res);
+ 	return res;
+ }
+@@ -121,10 +126,13 @@ static inline __must_check unsigned long
+ _copy_from_user(void *to, const void __user *from, unsigned long n)
+ {
+ 	unsigned long res = n;
++	void *rr_from = NULL;
+ 	might_fault();
+ 	if (!should_fail_usercopy() && likely(access_ok(from, n))) {
+ 		instrument_copy_from_user_before(to, from, n);
++
+ 		res = raw_copy_from_user(to, from, n);
++
+ 		instrument_copy_from_user_after(to, from, n, res);
+ 	}
+ 	if (unlikely(res))
+@@ -408,6 +416,11 @@ static inline void user_access_restore(unsigned long flags) { }
+ #ifndef user_read_access_begin
+ #define user_read_access_begin user_access_begin
+ #define user_read_access_end user_access_end
++
++#define user_read_access_begin_rr(from, len, rr_from) ({ \
++*rr_from = rr_record_cfu(from, 0, len); \
++user_access_begin(from, len);\
++})
+ #endif
+ 
+ #ifdef CONFIG_HARDENED_USERCOPY
+diff --git a/include/uapi/linux/kvm_para.h b/include/uapi/linux/kvm_para.h
+index 960c7e93d..32e99bffe 100644
+--- a/include/uapi/linux/kvm_para.h
++++ b/include/uapi/linux/kvm_para.h
+@@ -31,6 +31,8 @@
+ #define KVM_HC_SCHED_YIELD		11
+ #define KVM_HC_MAP_GPA_RANGE		12
+ 
++#define KVM_INSTRUCTION_SYNC		20
++
+ /*
+  * hypercalls use architecture specific
+  */
+diff --git a/init/main.c b/init/main.c
+index aa21add5f..91332f137 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -1409,6 +1409,7 @@ static void __init do_basic_setup(void)
+ 	init_irq_proc();
+ 	do_ctors();
+ 	do_initcalls();
++	kvm_ivshmem_init();
+ }
+ 
+ static void __init do_pre_smp_initcalls(void)
+@@ -1539,6 +1540,8 @@ static int __ref kernel_init(void *unused)
+ 
+ 	rcu_end_inkernel_boot();
+ 
++	init_smp_exec_lock();
++
+ 	do_sysctl_args();
+ 
+ 	if (ramdisk_execute_command) {
+diff --git a/io_uring/io_uring.c b/io_uring/io_uring.c
+index 8840cf3e2..ccd6cd832 100644
+--- a/io_uring/io_uring.c
++++ b/io_uring/io_uring.c
+@@ -2241,7 +2241,7 @@ static const struct io_uring_sqe *io_get_sqe(struct io_ring_ctx *ctx)
+ 		/* double index for 128-byte SQEs, twice as long */
+ 		if (ctx->flags & IORING_SETUP_SQE128)
+ 			head <<= 1;
+-		return &ctx->sq_sqes[head];
++		return RECORD_IO_URING_ENTRY(&ctx->sq_sqes[head], sizeof(ctx->sq_sqes[head]));
+ 	}
+ 
+ 	/* drop invalid entries */
+diff --git a/io_uring/io_uring.h b/io_uring/io_uring.h
+index 50bc3af44..53888d5aa 100644
+--- a/io_uring/io_uring.h
++++ b/io_uring/io_uring.h
+@@ -225,7 +225,7 @@ static inline bool io_sqring_full(struct io_ring_ctx *ctx)
+ {
+ 	struct io_rings *r = ctx->rings;
+ 
+-	return READ_ONCE(r->sq.tail) - ctx->cached_sq_head == ctx->sq_entries;
++	return RECORD_SQ_TAIL(READ_ONCE(r->sq.tail), &r->sq.tail) - ctx->cached_sq_head == ctx->sq_entries;
+ }
+ 
+ static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+@@ -233,7 +233,7 @@ static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+ 	struct io_rings *rings = ctx->rings;
+ 
+ 	/* make sure SQ entry isn't read before tail */
+-	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
++	return RECORD_SQ_TAIL(smp_load_acquire(&rings->sq.tail), &rings->sq.tail) - ctx->cached_sq_head;
+ }
+ 
+ static inline int io_run_task_work(void)
+diff --git a/kernel/entry/common.c b/kernel/entry/common.c
+index 846add839..3a7f68f6a 100644
+--- a/kernel/entry/common.c
++++ b/kernel/entry/common.c
+@@ -318,6 +318,7 @@ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
+ 	};
+ 
+ 	if (user_mode(regs)) {
++		rr_handle_irqentry();
+ 		irqentry_enter_from_user_mode(regs);
+ 		return ret;
+ 	}
+@@ -346,6 +347,7 @@ noinstr irqentry_state_t irqentry_enter(struct pt_regs *regs)
+ 	 * this part when enabled.
+ 	 */
+ 	if (!IS_ENABLED(CONFIG_TINY_RCU) && is_idle_task(current)) {
++		rr_handle_irqentry();
+ 		/*
+ 		 * If RCU is not watching then the same careful
+ 		 * sequence vs. lockdep and tracing is required
+@@ -410,6 +412,7 @@ noinstr void irqentry_exit(struct pt_regs *regs, irqentry_state_t state)
+ 	/* Check whether this returns to user mode */
+ 	if (user_mode(regs)) {
+ 		irqentry_exit_to_user_mode(regs);
++		rr_release_smp_exec(CTX_INTR);
+ 	} else if (!regs_irqs_disabled(regs)) {
+ 		/*
+ 		 * If RCU was not watching on entry this needs to be done
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index f26ab2675..9d3b32c7d 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -106,8 +106,12 @@ void __cpuidle default_idle_call(void)
+ 		ct_idle_enter();
+ 		lockdep_hardirqs_on(_THIS_IP_);
+ 
++		rr_release_smp_exec(CTX_IDLE);
++
+ 		arch_cpu_idle();
+ 
++		rr_acquire_smp_exec(CTX_IDLE, true);
++
+ 		/*
+ 		 * OK, so IRQs are enabled here, but RCU needs them disabled to
+ 		 * turn itself back on.. funny thing is that disabling IRQs
+@@ -189,6 +193,7 @@ static void cpuidle_idle_call(void)
+ 		tick_nohz_idle_stop_tick();
+ 
+ 		default_idle_call();
++
+ 		goto exit_idle;
+ 	}
+ 
+diff --git a/kernel/smp.c b/kernel/smp.c
+index 06a413987..3c8347333 100644
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@ -410,7 +410,11 @@ static __always_inline void csd_lock_wait(struct __call_single_data *csd)
+ 		return;
+ 	}
+ 
++	local_irq_disable();
++	rr_release_smp_exec(CTX_LOCKWAIT);
+ 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
++	rr_acquire_smp_exec(CTX_LOCKWAIT, true);
++	local_irq_enable();
+ }
+ 
+ static void __smp_call_single_queue_debug(int cpu, struct llist_node *node)
+@@ -439,7 +443,9 @@ static void csd_lock_record(struct __call_single_data *csd)
+ 
+ static __always_inline void csd_lock_wait(struct __call_single_data *csd)
+ {
++	rr_release_smp_exec(CTX_LOCKWAIT);
+ 	smp_cond_load_acquire(&csd->node.u_flags, !(VAL & CSD_FLAG_LOCK));
++	rr_acquire_smp_exec(CTX_LOCKWAIT, true);
+ }
+ #endif
+ 
+diff --git a/kernel/stop_machine.c b/kernel/stop_machine.c
+index cedb17ba1..088b28a7a 100644
+--- a/kernel/stop_machine.c
++++ b/kernel/stop_machine.c
+@@ -22,6 +22,7 @@
+ #include <linux/atomic.h>
+ #include <linux/nmi.h>
+ #include <linux/sched/wake_q.h>
++#include <asm/kernel_rr.h>
+ 
+ /*
+  * Structure to determine completion condition and record errors.  May
+@@ -226,7 +227,9 @@ static int multi_cpu_stop(void *data)
+ 	/* Simple state machine */
+ 	do {
+ 		/* Chill out and ensure we re-read multi_stop_state. */
++		rr_release_smp_exec(CTX_LOCKWAIT);
+ 		stop_machine_yield(cpumask);
++		rr_acquire_smp_exec(CTX_LOCKWAIT, true);
+ 		newstate = READ_ONCE(msdata->state);
+ 		if (newstate != curstate) {
+ 			curstate = newstate;
+diff --git a/kni/Kbuild b/kni/Kbuild
+new file mode 100644
+index 000000000..e5452d6c0
+--- /dev/null
++++ b/kni/Kbuild
+@@ -0,0 +1,6 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# Copyright(c) 2018 Luca Boccassi <bluca@debian.org>
++
++ccflags-y := $(MODULE_CFLAGS)
++obj-m := rte_kni.o
++rte_kni-y := $(patsubst $(src)/%.c,%.o,$(wildcard $(src)/*.c))
+diff --git a/kni/compat.h b/kni/compat.h
+new file mode 100644
+index 000000000..8beb67046
+--- /dev/null
++++ b/kni/compat.h
+@@ -0,0 +1,157 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Minimal wrappers to allow compiling kni on older kernels.
++ */
++
++#include <linux/version.h>
++
++#ifndef RHEL_RELEASE_VERSION
++#define RHEL_RELEASE_VERSION(a, b) (((a) << 8) + (b))
++#endif
++
++/* SuSE version macro is the same as Linux kernel version */
++#ifndef SLE_VERSION
++#define SLE_VERSION(a, b, c) KERNEL_VERSION(a, b, c)
++#endif
++#ifdef CONFIG_SUSE_KERNEL
++#if (LINUX_VERSION_CODE >= KERNEL_VERSION(4, 4, 57))
++/* SLES12SP3 is at least 4.4.57+ based */
++#define SLE_VERSION_CODE SLE_VERSION(12, 3, 0)
++#elif (LINUX_VERSION_CODE >= KERNEL_VERSION(3, 12, 28))
++/* SLES12 is at least 3.12.28+ based */
++#define SLE_VERSION_CODE SLE_VERSION(12, 0, 0)
++#elif ((LINUX_VERSION_CODE >= KERNEL_VERSION(3, 0, 61)) && \
++	(LINUX_VERSION_CODE < KERNEL_VERSION(3, 1, 0)))
++/* SLES11 SP3 is at least 3.0.61+ based */
++#define SLE_VERSION_CODE SLE_VERSION(11, 3, 0)
++#elif (LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 32))
++/* SLES11 SP1 is 2.6.32 based */
++#define SLE_VERSION_CODE SLE_VERSION(11, 1, 0)
++#elif (LINUX_VERSION_CODE == KERNEL_VERSION(2, 6, 27))
++/* SLES11 GA is 2.6.27 based */
++#define SLE_VERSION_CODE SLE_VERSION(11, 0, 0)
++#endif /* LINUX_VERSION_CODE == KERNEL_VERSION(x,y,z) */
++#endif /* CONFIG_SUSE_KERNEL */
++#ifndef SLE_VERSION_CODE
++#define SLE_VERSION_CODE 0
++#endif /* SLE_VERSION_CODE */
++
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39) && \
++	(!(defined(RHEL_RELEASE_CODE) && \
++	   RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(6, 4)))
++
++#define kstrtoul strict_strtoul
++
++#endif /* < 2.6.39 */
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 33)
++#define HAVE_SIMPLIFIED_PERNET_OPERATIONS
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 35)
++#define sk_sleep(s) ((s)->sk_sleep)
++#else
++#define HAVE_SOCKET_WQ
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 7, 0)
++#define HAVE_STATIC_SOCK_MAP_FD
++#else
++#define kni_sock_map_fd(s) sock_map_fd(s, 0)
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 9, 0)
++#define HAVE_CHANGE_CARRIER_CB
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 14, 0)
++#define ether_addr_copy(dst, src) memcpy(dst, src, ETH_ALEN)
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 19, 0)
++#define HAVE_IOV_ITER_MSGHDR
++#endif
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 1, 0)
++#define HAVE_KIOCB_MSG_PARAM
++#define HAVE_REBUILD_HEADER
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 2, 0)
++#define HAVE_SK_ALLOC_KERN_PARAM
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 7, 0) || \
++	(defined(RHEL_RELEASE_CODE) && \
++	 RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 4)) || \
++	(SLE_VERSION_CODE && SLE_VERSION_CODE == SLE_VERSION(12, 3, 0))
++#define HAVE_TRANS_START_HELPER
++#endif
++
++/*
++ * KNI uses NET_NAME_UNKNOWN macro to select correct version of alloc_netdev()
++ * For old kernels just backported the commit that enables the macro
++ * (685343fc3ba6) but still uses old API, it is required to undefine macro to
++ * select correct version of API, this is safe since KNI doesn't use the value.
++ * This fix is specific to RedHat/CentOS kernels.
++ */
++#if (defined(RHEL_RELEASE_CODE) && \
++	(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(6, 8)) && \
++	(LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 34)))
++#undef NET_NAME_UNKNOWN
++#endif
++
++/*
++ * RHEL has two different version with different kernel version:
++ * 3.10 is for AMD, Intel, IBM POWER7 and POWER8;
++ * 4.14 is for ARM and IBM POWER9
++ */
++#if (defined(RHEL_RELEASE_CODE) && \
++	(RHEL_RELEASE_CODE >= RHEL_RELEASE_VERSION(7, 5)) && \
++	(RHEL_RELEASE_CODE < RHEL_RELEASE_VERSION(8, 0)) && \
++	(LINUX_VERSION_CODE < KERNEL_VERSION(4, 14, 0)))
++#define ndo_change_mtu ndo_change_mtu_rh74
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
++#define HAVE_MAX_MTU_PARAM
++#endif
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
++#define HAVE_SIGNAL_FUNCTIONS_OWN_HEADER
++#endif
++
++/*
++ * iova to kva mapping support can be provided since 4.6.0, but required
++ * kernel version increased to >= 4.10.0 because of the updates in
++ * get_user_pages_remote() kernel API
++ */
++#if KERNEL_VERSION(4, 10, 0) <= LINUX_VERSION_CODE
++#define HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++#endif
++
++#if KERNEL_VERSION(5, 6, 0) <= LINUX_VERSION_CODE || \
++	(defined(RHEL_RELEASE_CODE) && \
++	 RHEL_RELEASE_VERSION(8, 3) <= RHEL_RELEASE_CODE) || \
++	 (defined(CONFIG_SUSE_KERNEL) && defined(HAVE_ARG_TX_QUEUE))
++#define HAVE_TX_TIMEOUT_TXQUEUE
++#endif
++
++#if KERNEL_VERSION(5, 9, 0) > LINUX_VERSION_CODE
++#define HAVE_TSK_IN_GUP
++#endif
++
++#if KERNEL_VERSION(5, 15, 0) <= LINUX_VERSION_CODE
++#define HAVE_ETH_HW_ADDR_SET
++#endif
++
++#if KERNEL_VERSION(5, 18, 0) > LINUX_VERSION_CODE && \
++	(!(defined(RHEL_RELEASE_CODE) && \
++	 RHEL_RELEASE_VERSION(9, 1) <= RHEL_RELEASE_CODE))
++#define HAVE_NETIF_RX_NI
++#endif
++
++#if KERNEL_VERSION(6, 5, 0) > LINUX_VERSION_CODE
++#define HAVE_VMA_IN_GUP
++#endif
+diff --git a/kni/kni_dev.h b/kni/kni_dev.h
+new file mode 100644
+index 000000000..df714b27e
+--- /dev/null
++++ b/kni/kni_dev.h
+@@ -0,0 +1,137 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright(c) 2010-2014 Intel Corporation.
++ */
++
++#ifndef _KNI_DEV_H_
++#define _KNI_DEV_H_
++
++#ifdef pr_fmt
++#undef pr_fmt
++#endif
++#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++
++#define KNI_VERSION	"1.0"
++
++#include "compat.h"
++
++#include <linux/if.h>
++#include <linux/wait.h>
++#ifdef HAVE_SIGNAL_FUNCTIONS_OWN_HEADER
++#include <linux/sched/signal.h>
++#else
++#include <linux/sched.h>
++#endif
++#include <linux/netdevice.h>
++#include <linux/spinlock.h>
++#include <linux/list.h>
++
++#include "rte_kni_common.h"
++#define KNI_KTHREAD_MAX_RESCHEDULE_INTERVAL 1000000 /* us */
++
++#define MBUF_BURST_SZ 32
++
++/* Default carrier state for created KNI network interfaces */
++extern uint32_t kni_dflt_carrier;
++
++/* Request processing support for bifurcated drivers. */
++extern uint32_t bifurcated_support;
++
++/**
++ * A structure describing the private information for a kni device.
++ */
++struct kni_dev {
++	/* kni list */
++	struct list_head list;
++
++	uint8_t iova_mode;
++
++	uint32_t core_id;            /* Core ID to bind */
++	char name[RTE_KNI_NAMESIZE]; /* Network device name */
++	struct task_struct *pthread;
++
++	/* wait queue for req/resp */
++	wait_queue_head_t wq;
++	struct mutex sync_lock;
++
++	/* kni device */
++	struct net_device *net_dev;
++
++	/* queue for packets to be sent out */
++	struct rte_kni_fifo *tx_q;
++
++	/* queue for the packets received */
++	struct rte_kni_fifo *rx_q;
++
++	/* queue for the allocated mbufs those can be used to save sk buffs */
++	struct rte_kni_fifo *alloc_q;
++
++	/* free queue for the mbufs to be freed */
++	struct rte_kni_fifo *free_q;
++
++	/* request queue */
++	struct rte_kni_fifo *req_q;
++
++	/* response queue */
++	struct rte_kni_fifo *resp_q;
++
++	void *sync_kva;
++	void *sync_va;
++
++	void *mbuf_kva;
++	void *mbuf_va;
++
++	/* mbuf size */
++	uint32_t mbuf_size;
++
++	/* buffers */
++	void *pa[MBUF_BURST_SZ];
++	void *va[MBUF_BURST_SZ];
++	void *alloc_pa[MBUF_BURST_SZ];
++	void *alloc_va[MBUF_BURST_SZ];
++
++	struct task_struct *usr_tsk;
++};
++
++#ifdef HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++static inline phys_addr_t iova_to_phys(struct task_struct *tsk,
++				       unsigned long iova)
++{
++	phys_addr_t offset, phys_addr;
++	struct page *page = NULL;
++	long ret;
++
++	offset = iova & (PAGE_SIZE - 1);
++
++	/* Read one page struct info */
++#ifdef HAVE_TSK_IN_GUP
++	ret = get_user_pages_remote(tsk, tsk->mm, iova, 1, 0, &page, NULL, NULL);
++#else
++  #ifdef HAVE_VMA_IN_GUP
++	ret = get_user_pages_remote(tsk->mm, iova, 1, 0, &page, NULL, NULL);
++  #else
++	ret = get_user_pages_remote(tsk->mm, iova, 1, 0, &page, NULL);
++  #endif
++#endif
++	if (ret < 0)
++		return 0;
++
++	phys_addr = page_to_phys(page) | offset;
++	put_page(page);
++
++	return phys_addr;
++}
++
++static inline void *iova_to_kva(struct task_struct *tsk, unsigned long iova)
++{
++	return phys_to_virt(iova_to_phys(tsk, iova));
++}
++#endif
++
++void kni_net_release_fifo_phy(struct kni_dev *kni);
++void kni_net_rx(struct kni_dev *kni);
++void kni_net_init(struct net_device *dev);
++void kni_net_config_lo_mode(char *lo_str);
++void kni_net_poll_resp(struct kni_dev *kni);
++
++#endif
+diff --git a/kni/kni_fifo.h b/kni/kni_fifo.h
+new file mode 100644
+index 000000000..2e4198a95
+--- /dev/null
++++ b/kni/kni_fifo.h
+@@ -0,0 +1,87 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright(c) 2010-2014 Intel Corporation.
++ */
++
++#ifndef _KNI_FIFO_H_
++#define _KNI_FIFO_H_
++
++#include "rte_kni_common.h"
++
++/* Skip some memory barriers on Linux < 3.14 */
++#ifndef smp_load_acquire
++#define smp_load_acquire(a) (*(a))
++#endif
++#ifndef smp_store_release
++#define smp_store_release(a, b) *(a) = (b)
++#endif
++
++/**
++ * Adds num elements into the fifo. Return the number actually written
++ */
++static inline uint32_t
++kni_fifo_put(struct rte_kni_fifo *fifo, void **data, uint32_t num)
++{
++	uint32_t i = 0;
++	uint32_t fifo_write = fifo->write;
++	uint32_t fifo_read = smp_load_acquire(&fifo->read);
++	uint32_t new_write = fifo_write;
++
++	for (i = 0; i < num; i++) {
++		new_write = (new_write + 1) & (fifo->len - 1);
++
++		if (new_write == fifo_read)
++			break;
++		fifo->buffer[fifo_write] = data[i];
++		fifo_write = new_write;
++	}
++	smp_store_release(&fifo->write, fifo_write);
++
++	return i;
++}
++
++/**
++ * Get up to num elements from the FIFO. Return the number actually read
++ */
++static inline uint32_t
++kni_fifo_get(struct rte_kni_fifo *fifo, void **data, uint32_t num)
++{
++	uint32_t i = 0;
++	uint32_t new_read = fifo->read;
++	uint32_t fifo_write = smp_load_acquire(&fifo->write);
++
++	for (i = 0; i < num; i++) {
++		if (new_read == fifo_write)
++			break;
++
++		data[i] = fifo->buffer[new_read];
++		new_read = (new_read + 1) & (fifo->len - 1);
++	}
++	smp_store_release(&fifo->read, new_read);
++
++	return i;
++}
++
++/**
++ * Get the num of elements in the fifo
++ */
++static inline uint32_t
++kni_fifo_count(struct rte_kni_fifo *fifo)
++{
++	uint32_t fifo_write = smp_load_acquire(&fifo->write);
++	uint32_t fifo_read = smp_load_acquire(&fifo->read);
++	return (fifo->len + fifo_write - fifo_read) & (fifo->len - 1);
++}
++
++/**
++ * Get the num of available elements in the fifo
++ */
++static inline uint32_t
++kni_fifo_free_count(struct rte_kni_fifo *fifo)
++{
++	uint32_t fifo_write = smp_load_acquire(&fifo->write);
++	uint32_t fifo_read = smp_load_acquire(&fifo->read);
++	return (fifo_read - fifo_write - 1) & (fifo->len - 1);
++}
++
++#endif /* _KNI_FIFO_H_ */
+diff --git a/kni/kni_misc.c b/kni/kni_misc.c
+new file mode 100644
+index 000000000..f44702ba3
+--- /dev/null
++++ b/kni/kni_misc.c
+@@ -0,0 +1,719 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright(c) 2010-2014 Intel Corporation.
++ */
++
++#include <linux/version.h>
++#include <linux/module.h>
++#include <linux/miscdevice.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/pci.h>
++#include <linux/kthread.h>
++#include <linux/rwsem.h>
++#include <linux/mutex.h>
++#include <linux/nsproxy.h>
++#include <net/net_namespace.h>
++#include <net/netns/generic.h>
++
++#include "rte_kni_common.h"
++
++#include "compat.h"
++#include "kni_dev.h"
++
++MODULE_VERSION(KNI_VERSION);
++MODULE_LICENSE("Dual BSD/GPL");
++MODULE_AUTHOR("Intel Corporation");
++MODULE_DESCRIPTION("Kernel Module for managing kni devices");
++
++#define KNI_RX_LOOP_NUM 1000
++
++#define KNI_MAX_DEVICES 32
++
++/* loopback mode */
++static char *lo_mode;
++
++/* Kernel thread mode */
++static char *kthread_mode;
++static uint32_t multiple_kthread_on;
++
++/* Default carrier state for created KNI network interfaces */
++static char *carrier;
++uint32_t kni_dflt_carrier;
++
++/* Request processing support for bifurcated drivers. */
++static char *enable_bifurcated;
++uint32_t bifurcated_support;
++
++/* KNI thread scheduling interval */
++static long min_scheduling_interval = 100; /* us */
++static long max_scheduling_interval = 200; /* us */
++
++#define KNI_DEV_IN_USE_BIT_NUM 0 /* Bit number for device in use */
++
++static int kni_net_id;
++
++struct kni_net {
++	unsigned long device_in_use; /* device in use flag */
++	struct mutex kni_kthread_lock;
++	struct task_struct *kni_kthread;
++	struct rw_semaphore kni_list_lock;
++	struct list_head kni_list_head;
++};
++
++static int __net_init
++kni_init_net(struct net *net)
++{
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	struct kni_net *knet = net_generic(net, kni_net_id);
++
++	memset(knet, 0, sizeof(*knet));
++#else
++	struct kni_net *knet;
++	int ret;
++
++	knet = kzalloc(sizeof(struct kni_net), GFP_KERNEL);
++	if (!knet) {
++		ret = -ENOMEM;
++		return ret;
++	}
++#endif
++
++	/* Clear the bit of device in use */
++	clear_bit(KNI_DEV_IN_USE_BIT_NUM, &knet->device_in_use);
++
++	mutex_init(&knet->kni_kthread_lock);
++
++	init_rwsem(&knet->kni_list_lock);
++	INIT_LIST_HEAD(&knet->kni_list_head);
++
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	return 0;
++#else
++	ret = net_assign_generic(net, kni_net_id, knet);
++	if (ret < 0)
++		kfree(knet);
++
++	return ret;
++#endif
++}
++
++static void __net_exit
++kni_exit_net(struct net *net)
++{
++	struct kni_net *knet __maybe_unused;
++
++	knet = net_generic(net, kni_net_id);
++	mutex_destroy(&knet->kni_kthread_lock);
++
++#ifndef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	kfree(knet);
++#endif
++}
++
++static struct pernet_operations kni_net_ops = {
++	.init = kni_init_net,
++	.exit = kni_exit_net,
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	.id   = &kni_net_id,
++	.size = sizeof(struct kni_net),
++#endif
++};
++
++static int
++kni_thread_single(void *data)
++{
++	struct kni_net *knet = data;
++	int j;
++	struct kni_dev *dev;
++
++	while (!kthread_should_stop()) {
++		down_read(&knet->kni_list_lock);
++		for (j = 0; j < KNI_RX_LOOP_NUM; j++) {
++			list_for_each_entry(dev, &knet->kni_list_head, list) {
++				kni_net_rx(dev);
++				kni_net_poll_resp(dev);
++			}
++		}
++		up_read(&knet->kni_list_lock);
++		/* reschedule out for a while */
++		usleep_range(min_scheduling_interval, max_scheduling_interval);
++	}
++
++	return 0;
++}
++
++static int
++kni_thread_multiple(void *param)
++{
++	int j;
++	struct kni_dev *dev = param;
++
++	while (!kthread_should_stop()) {
++		for (j = 0; j < KNI_RX_LOOP_NUM; j++) {
++			kni_net_rx(dev);
++			kni_net_poll_resp(dev);
++		}
++		usleep_range(min_scheduling_interval, max_scheduling_interval);
++	}
++
++	return 0;
++}
++
++static int
++kni_open(struct inode *inode, struct file *file)
++{
++	struct net *net = current->nsproxy->net_ns;
++	struct kni_net *knet = net_generic(net, kni_net_id);
++
++	/* kni device can be opened by one user only per netns */
++	if (test_and_set_bit(KNI_DEV_IN_USE_BIT_NUM, &knet->device_in_use))
++		return -EBUSY;
++
++	file->private_data = get_net(net);
++	pr_debug("/dev/kni opened\n");
++
++	return 0;
++}
++
++static int
++kni_dev_remove(struct kni_dev *dev)
++{
++	if (!dev)
++		return -ENODEV;
++
++	/*
++	 * The memory of kni device is allocated and released together
++	 * with net device. Release mbuf before freeing net device.
++	 */
++	kni_net_release_fifo_phy(dev);
++
++	if (dev->net_dev) {
++		unregister_netdev(dev->net_dev);
++		free_netdev(dev->net_dev);
++	}
++
++	return 0;
++}
++
++static int
++kni_release(struct inode *inode, struct file *file)
++{
++	struct net *net = file->private_data;
++	struct kni_net *knet = net_generic(net, kni_net_id);
++	struct kni_dev *dev, *n;
++
++	/* Stop kernel thread for single mode */
++	if (multiple_kthread_on == 0) {
++		mutex_lock(&knet->kni_kthread_lock);
++		/* Stop kernel thread */
++		if (knet->kni_kthread != NULL) {
++			kthread_stop(knet->kni_kthread);
++			knet->kni_kthread = NULL;
++		}
++		mutex_unlock(&knet->kni_kthread_lock);
++	}
++
++	down_write(&knet->kni_list_lock);
++	list_for_each_entry_safe(dev, n, &knet->kni_list_head, list) {
++		/* Stop kernel thread for multiple mode */
++		if (multiple_kthread_on && dev->pthread != NULL) {
++			kthread_stop(dev->pthread);
++			dev->pthread = NULL;
++		}
++
++		list_del(&dev->list);
++		kni_dev_remove(dev);
++	}
++	up_write(&knet->kni_list_lock);
++
++	/* Clear the bit of device in use */
++	clear_bit(KNI_DEV_IN_USE_BIT_NUM, &knet->device_in_use);
++
++	put_net(net);
++	pr_debug("/dev/kni closed\n");
++
++	return 0;
++}
++
++static int
++kni_check_param(struct kni_dev *kni, struct rte_kni_device_info *dev)
++{
++	if (!kni || !dev)
++		return -1;
++
++	/* Check if network name has been used */
++	if (!strncmp(kni->name, dev->name, RTE_KNI_NAMESIZE)) {
++		pr_err("KNI name %s duplicated\n", dev->name);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int
++kni_run_thread(struct kni_net *knet, struct kni_dev *kni, uint8_t force_bind)
++{
++	/**
++	 * Create a new kernel thread for multiple mode, set its core affinity,
++	 * and finally wake it up.
++	 */
++	if (multiple_kthread_on) {
++		kni->pthread = kthread_create(kni_thread_multiple,
++			(void *)kni, "kni_%s", kni->name);
++		if (IS_ERR(kni->pthread)) {
++			kni_dev_remove(kni);
++			return -ECANCELED;
++		}
++
++		if (force_bind)
++			kthread_bind(kni->pthread, kni->core_id);
++		wake_up_process(kni->pthread);
++	} else {
++		mutex_lock(&knet->kni_kthread_lock);
++
++		if (knet->kni_kthread == NULL) {
++			knet->kni_kthread = kthread_create(kni_thread_single,
++				(void *)knet, "kni_single");
++			if (IS_ERR(knet->kni_kthread)) {
++				mutex_unlock(&knet->kni_kthread_lock);
++				kni_dev_remove(kni);
++				return -ECANCELED;
++			}
++
++			if (force_bind)
++				kthread_bind(knet->kni_kthread, kni->core_id);
++			wake_up_process(knet->kni_kthread);
++		}
++
++		mutex_unlock(&knet->kni_kthread_lock);
++	}
++
++	return 0;
++}
++
++static int
++kni_ioctl_create(struct net *net, uint32_t ioctl_num,
++		unsigned long ioctl_param)
++{
++	struct kni_net *knet = net_generic(net, kni_net_id);
++	int ret;
++	struct rte_kni_device_info dev_info;
++	struct net_device *net_dev = NULL;
++	struct kni_dev *kni, *dev, *n;
++
++	pr_info("Creating kni...\n");
++	/* Check the buffer size, to avoid warning */
++	if (_IOC_SIZE(ioctl_num) > sizeof(dev_info))
++		return -EINVAL;
++
++	/* Copy kni info from user space */
++	if (copy_from_user(&dev_info, (void *)ioctl_param, sizeof(dev_info)))
++		return -EFAULT;
++
++	/* Check if name is zero-ended */
++	if (strnlen(dev_info.name, sizeof(dev_info.name)) == sizeof(dev_info.name)) {
++		pr_err("kni.name not zero-terminated");
++		return -EINVAL;
++	}
++
++	/**
++	 * Check if the cpu core id is valid for binding.
++	 */
++	if (dev_info.force_bind && !cpu_online(dev_info.core_id)) {
++		pr_err("cpu %u is not online\n", dev_info.core_id);
++		return -EINVAL;
++	}
++
++	/* Check if it has been created */
++	down_read(&knet->kni_list_lock);
++	list_for_each_entry_safe(dev, n, &knet->kni_list_head, list) {
++		if (kni_check_param(dev, &dev_info) < 0) {
++			up_read(&knet->kni_list_lock);
++			return -EINVAL;
++		}
++	}
++	up_read(&knet->kni_list_lock);
++
++	net_dev = alloc_netdev(sizeof(struct kni_dev), dev_info.name,
++#ifdef NET_NAME_USER
++							NET_NAME_USER,
++#endif
++							kni_net_init);
++	if (net_dev == NULL) {
++		pr_err("error allocating device \"%s\"\n", dev_info.name);
++		return -EBUSY;
++	}
++
++	dev_net_set(net_dev, net);
++
++	kni = netdev_priv(net_dev);
++
++	kni->net_dev = net_dev;
++	kni->core_id = dev_info.core_id;
++	strncpy(kni->name, dev_info.name, RTE_KNI_NAMESIZE);
++
++	/* Translate user space info into kernel space info */
++	if (dev_info.iova_mode) {
++#ifdef HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++		kni->tx_q = iova_to_kva(current, dev_info.tx_phys);
++		kni->rx_q = iova_to_kva(current, dev_info.rx_phys);
++		kni->alloc_q = iova_to_kva(current, dev_info.alloc_phys);
++		kni->free_q = iova_to_kva(current, dev_info.free_phys);
++
++		kni->req_q = iova_to_kva(current, dev_info.req_phys);
++		kni->resp_q = iova_to_kva(current, dev_info.resp_phys);
++		kni->sync_va = dev_info.sync_va;
++		kni->sync_kva = iova_to_kva(current, dev_info.sync_phys);
++		kni->usr_tsk = current;
++		kni->iova_mode = 1;
++#else
++		pr_err("KNI module does not support IOVA to VA translation\n");
++		return -EINVAL;
++#endif
++	} else {
++
++		kni->tx_q = phys_to_virt(dev_info.tx_phys);
++		kni->rx_q = phys_to_virt(dev_info.rx_phys);
++		kni->alloc_q = phys_to_virt(dev_info.alloc_phys);
++		kni->free_q = phys_to_virt(dev_info.free_phys);
++
++		kni->req_q = phys_to_virt(dev_info.req_phys);
++		kni->resp_q = phys_to_virt(dev_info.resp_phys);
++		kni->sync_va = dev_info.sync_va;
++		kni->sync_kva = phys_to_virt(dev_info.sync_phys);
++		kni->iova_mode = 0;
++	}
++
++	kni->mbuf_size = dev_info.mbuf_size;
++
++	pr_debug("tx_phys:      0x%016llx, tx_q addr:      0x%p\n",
++		(unsigned long long) dev_info.tx_phys, kni->tx_q);
++	pr_debug("rx_phys:      0x%016llx, rx_q addr:      0x%p\n",
++		(unsigned long long) dev_info.rx_phys, kni->rx_q);
++	pr_debug("alloc_phys:   0x%016llx, alloc_q addr:   0x%p\n",
++		(unsigned long long) dev_info.alloc_phys, kni->alloc_q);
++	pr_debug("free_phys:    0x%016llx, free_q addr:    0x%p\n",
++		(unsigned long long) dev_info.free_phys, kni->free_q);
++	pr_debug("req_phys:     0x%016llx, req_q addr:     0x%p\n",
++		(unsigned long long) dev_info.req_phys, kni->req_q);
++	pr_debug("resp_phys:    0x%016llx, resp_q addr:    0x%p\n",
++		(unsigned long long) dev_info.resp_phys, kni->resp_q);
++	pr_debug("mbuf_size:    %u\n", kni->mbuf_size);
++
++	/* if user has provided a valid mac address */
++	if (is_valid_ether_addr(dev_info.mac_addr)) {
++#ifdef HAVE_ETH_HW_ADDR_SET
++		eth_hw_addr_set(net_dev, dev_info.mac_addr);
++#else
++		memcpy(net_dev->dev_addr, dev_info.mac_addr, ETH_ALEN);
++#endif
++	} else {
++		/* Assign random MAC address. */
++		eth_hw_addr_random(net_dev);
++	}
++
++	if (dev_info.mtu)
++		net_dev->mtu = dev_info.mtu;
++#ifdef HAVE_MAX_MTU_PARAM
++	net_dev->max_mtu = net_dev->mtu;
++
++	if (dev_info.min_mtu)
++		net_dev->min_mtu = dev_info.min_mtu;
++
++	if (dev_info.max_mtu)
++		net_dev->max_mtu = dev_info.max_mtu;
++#endif
++
++	ret = register_netdev(net_dev);
++	if (ret) {
++		pr_err("error %i registering device \"%s\"\n",
++					ret, dev_info.name);
++		kni->net_dev = NULL;
++		kni_dev_remove(kni);
++		free_netdev(net_dev);
++		return -ENODEV;
++	}
++
++	netif_carrier_off(net_dev);
++
++	ret = kni_run_thread(knet, kni, dev_info.force_bind);
++	if (ret != 0)
++		return ret;
++
++	down_write(&knet->kni_list_lock);
++	list_add(&kni->list, &knet->kni_list_head);
++	up_write(&knet->kni_list_lock);
++
++	return 0;
++}
++
++static int
++kni_ioctl_release(struct net *net, uint32_t ioctl_num,
++		unsigned long ioctl_param)
++{
++	struct kni_net *knet = net_generic(net, kni_net_id);
++	int ret = -EINVAL;
++	struct kni_dev *dev, *n;
++	struct rte_kni_device_info dev_info;
++
++	if (_IOC_SIZE(ioctl_num) > sizeof(dev_info))
++		return -EINVAL;
++
++	if (copy_from_user(&dev_info, (void *)ioctl_param, sizeof(dev_info)))
++		return -EFAULT;
++
++	/* Release the network device according to its name */
++	if (strlen(dev_info.name) == 0)
++		return -EINVAL;
++
++	down_write(&knet->kni_list_lock);
++	list_for_each_entry_safe(dev, n, &knet->kni_list_head, list) {
++		if (strncmp(dev->name, dev_info.name, RTE_KNI_NAMESIZE) != 0)
++			continue;
++
++		if (multiple_kthread_on && dev->pthread != NULL) {
++			kthread_stop(dev->pthread);
++			dev->pthread = NULL;
++		}
++
++		list_del(&dev->list);
++		kni_dev_remove(dev);
++		ret = 0;
++		break;
++	}
++	up_write(&knet->kni_list_lock);
++	pr_info("%s release kni named %s\n",
++		(ret == 0 ? "Successfully" : "Unsuccessfully"), dev_info.name);
++
++	return ret;
++}
++
++static long
++kni_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
++{
++	long ret = -EINVAL;
++	struct net *net = current->nsproxy->net_ns;
++
++	pr_debug("IOCTL num=0x%0x param=0x%0lx\n", ioctl_num, ioctl_param);
++
++	/*
++	 * Switch according to the ioctl called
++	 */
++	switch (_IOC_NR(ioctl_num)) {
++	case _IOC_NR(RTE_KNI_IOCTL_TEST):
++		/* For test only, not used */
++		break;
++	case _IOC_NR(RTE_KNI_IOCTL_CREATE):
++		ret = kni_ioctl_create(net, ioctl_num, ioctl_param);
++		break;
++	case _IOC_NR(RTE_KNI_IOCTL_RELEASE):
++		ret = kni_ioctl_release(net, ioctl_num, ioctl_param);
++		break;
++	default:
++		pr_debug("IOCTL default\n");
++		break;
++	}
++
++	return ret;
++}
++
++static long
++kni_compat_ioctl(struct file *file, unsigned int ioctl_num,
++		unsigned long ioctl_param)
++{
++	/* 32 bits app on 64 bits OS to be supported later */
++	pr_debug("Not implemented.\n");
++
++	return -EINVAL;
++}
++
++static const struct file_operations kni_fops = {
++	.owner = THIS_MODULE,
++	.open = kni_open,
++	.release = kni_release,
++	.unlocked_ioctl = kni_ioctl,
++	.compat_ioctl = kni_compat_ioctl,
++};
++
++static struct miscdevice kni_misc = {
++	.minor = MISC_DYNAMIC_MINOR,
++	.name = KNI_DEVICE,
++	.fops = &kni_fops,
++};
++
++static int __init
++kni_parse_kthread_mode(void)
++{
++	if (!kthread_mode)
++		return 0;
++
++	if (strcmp(kthread_mode, "single") == 0)
++		return 0;
++	else if (strcmp(kthread_mode, "multiple") == 0)
++		multiple_kthread_on = 1;
++	else
++		return -1;
++
++	return 0;
++}
++
++static int __init
++kni_parse_carrier_state(void)
++{
++	if (!carrier) {
++		kni_dflt_carrier = 0;
++		return 0;
++	}
++
++	if (strcmp(carrier, "off") == 0)
++		kni_dflt_carrier = 0;
++	else if (strcmp(carrier, "on") == 0)
++		kni_dflt_carrier = 1;
++	else
++		return -1;
++
++	return 0;
++}
++
++static int __init
++kni_parse_bifurcated_support(void)
++{
++	if (!enable_bifurcated) {
++		bifurcated_support = 0;
++		return 0;
++	}
++
++	if (strcmp(enable_bifurcated, "on") == 0)
++		bifurcated_support = 1;
++	else
++		return -1;
++
++	return 0;
++}
++
++static int __init
++kni_init(void)
++{
++	int rc;
++
++	if (kni_parse_kthread_mode() < 0) {
++		pr_err("Invalid parameter for kthread_mode\n");
++		return -EINVAL;
++	}
++
++	if (multiple_kthread_on == 0)
++		pr_debug("Single kernel thread for all KNI devices\n");
++	else
++		pr_debug("Multiple kernel thread mode enabled\n");
++
++	if (kni_parse_carrier_state() < 0) {
++		pr_err("Invalid parameter for carrier\n");
++		return -EINVAL;
++	}
++
++	if (kni_dflt_carrier == 0)
++		pr_debug("Default carrier state set to off.\n");
++	else
++		pr_debug("Default carrier state set to on.\n");
++
++	if (kni_parse_bifurcated_support() < 0) {
++		pr_err("Invalid parameter for bifurcated support\n");
++		return -EINVAL;
++	}
++	if (bifurcated_support == 1)
++		pr_debug("bifurcated support is enabled.\n");
++
++	if (min_scheduling_interval < 0 || max_scheduling_interval < 0 ||
++		min_scheduling_interval > KNI_KTHREAD_MAX_RESCHEDULE_INTERVAL ||
++		max_scheduling_interval > KNI_KTHREAD_MAX_RESCHEDULE_INTERVAL ||
++		min_scheduling_interval >= max_scheduling_interval) {
++		pr_err("Invalid parameters for scheduling interval\n");
++		return -EINVAL;
++	}
++
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	rc = register_pernet_subsys(&kni_net_ops);
++#else
++	rc = register_pernet_gen_subsys(&kni_net_id, &kni_net_ops);
++#endif
++	if (rc)
++		return -EPERM;
++
++	rc = misc_register(&kni_misc);
++	if (rc != 0) {
++		pr_err("Misc registration failed\n");
++		goto out;
++	}
++
++	/* Configure the lo mode according to the input parameter */
++	kni_net_config_lo_mode(lo_mode);
++
++	return 0;
++
++out:
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	unregister_pernet_subsys(&kni_net_ops);
++#else
++	unregister_pernet_gen_subsys(kni_net_id, &kni_net_ops);
++#endif
++	return rc;
++}
++
++static void __exit
++kni_exit(void)
++{
++	misc_deregister(&kni_misc);
++#ifdef HAVE_SIMPLIFIED_PERNET_OPERATIONS
++	unregister_pernet_subsys(&kni_net_ops);
++#else
++	unregister_pernet_gen_subsys(kni_net_id, &kni_net_ops);
++#endif
++}
++
++module_init(kni_init);
++module_exit(kni_exit);
++
++module_param(lo_mode, charp, 0644);
++MODULE_PARM_DESC(lo_mode,
++"KNI loopback mode (default=lo_mode_none):\n"
++"\t\tlo_mode_none        Kernel loopback disabled\n"
++"\t\tlo_mode_fifo        Enable kernel loopback with fifo\n"
++"\t\tlo_mode_fifo_skb    Enable kernel loopback with fifo and skb buffer\n"
++"\t\t"
++);
++
++module_param(kthread_mode, charp, 0644);
++MODULE_PARM_DESC(kthread_mode,
++"Kernel thread mode (default=single):\n"
++"\t\tsingle    Single kernel thread mode enabled.\n"
++"\t\tmultiple  Multiple kernel thread mode enabled.\n"
++"\t\t"
++);
++
++module_param(carrier, charp, 0644);
++MODULE_PARM_DESC(carrier,
++"Default carrier state for KNI interface (default=off):\n"
++"\t\toff   Interfaces will be created with carrier state set to off.\n"
++"\t\ton    Interfaces will be created with carrier state set to on.\n"
++"\t\t"
++);
++
++module_param(enable_bifurcated, charp, 0644);
++MODULE_PARM_DESC(enable_bifurcated,
++"Enable request processing support for bifurcated drivers, "
++"which means releasing rtnl_lock before calling userspace callback and "
++"supporting async requests (default=off):\n"
++"\t\ton    Enable request processing support for bifurcated drivers.\n"
++"\t\t"
++);
++
++module_param(min_scheduling_interval, long, 0644);
++MODULE_PARM_DESC(min_scheduling_interval,
++"KNI thread min scheduling interval (default=100 microseconds)"
++);
++
++module_param(max_scheduling_interval, long, 0644);
++MODULE_PARM_DESC(max_scheduling_interval,
++"KNI thread max scheduling interval (default=200 microseconds)"
++);
+diff --git a/kni/kni_net.c b/kni/kni_net.c
+new file mode 100644
+index 000000000..1c981566b
+--- /dev/null
++++ b/kni/kni_net.c
+@@ -0,0 +1,878 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright(c) 2010-2014 Intel Corporation.
++ */
++
++/*
++ * This code is inspired from the book "Linux Device Drivers" by
++ * Alessandro Rubini and Jonathan Corbet, published by O'Reilly & Associates
++ */
++
++#include <linux/device.h>
++#include <linux/module.h>
++#include <linux/version.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h> /* eth_type_trans */
++#include <linux/ethtool.h>
++#include <linux/skbuff.h>
++#include <linux/kthread.h>
++#include <linux/delay.h>
++#include <linux/rtnetlink.h>
++
++#include "rte_kni_common.h"
++#include "kni_fifo.h"
++
++#include "compat.h"
++#include "kni_dev.h"
++
++#define WD_TIMEOUT 5 /*jiffies */
++
++#define KNI_WAIT_RESPONSE_TIMEOUT 300 /* 3 seconds */
++
++/* typedef for rx function */
++typedef void (*kni_net_rx_t)(struct kni_dev *kni);
++
++static void kni_net_rx_normal(struct kni_dev *kni);
++
++/* kni rx function pointer, with default to normal rx */
++static kni_net_rx_t kni_net_rx_func = kni_net_rx_normal;
++
++#ifdef HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++/* iova to kernel virtual address */
++static inline void *
++iova2kva(struct kni_dev *kni, void *iova)
++{
++	return phys_to_virt(iova_to_phys(kni->usr_tsk, (unsigned long)iova));
++}
++
++static inline void *
++iova2data_kva(struct kni_dev *kni, struct rte_kni_mbuf *m)
++{
++	return phys_to_virt(iova_to_phys(kni->usr_tsk, m->buf_iova) +
++			    m->data_off);
++}
++#endif
++
++/* physical address to kernel virtual address */
++static void *
++pa2kva(void *pa)
++{
++	return phys_to_virt((unsigned long)pa);
++}
++
++/* physical address to virtual address */
++static void *
++pa2va(void *pa, struct rte_kni_mbuf *m)
++{
++	void *va;
++
++	va = (void *)((unsigned long)pa +
++			(unsigned long)m->buf_addr -
++			(unsigned long)m->buf_iova);
++	return va;
++}
++
++/* mbuf data kernel virtual address from mbuf kernel virtual address */
++static void *
++kva2data_kva(struct rte_kni_mbuf *m)
++{
++	return phys_to_virt(m->buf_iova + m->data_off);
++}
++
++static inline void *
++get_kva(struct kni_dev *kni, void *pa)
++{
++#ifdef HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++	if (kni->iova_mode == 1)
++		return iova2kva(kni, pa);
++#endif
++	return pa2kva(pa);
++}
++
++static inline void *
++get_data_kva(struct kni_dev *kni, void *pkt_kva)
++{
++#ifdef HAVE_IOVA_TO_KVA_MAPPING_SUPPORT
++	if (kni->iova_mode == 1)
++		return iova2data_kva(kni, pkt_kva);
++#endif
++	return kva2data_kva(pkt_kva);
++}
++
++/*
++ * It can be called to process the request.
++ */
++static int
++kni_net_process_request(struct net_device *dev, struct rte_kni_request *req)
++{
++	struct kni_dev *kni = netdev_priv(dev);
++	int ret = -1;
++	void *resp_va;
++	uint32_t num;
++	int ret_val;
++
++	ASSERT_RTNL();
++
++	if (bifurcated_support) {
++		/* If we need to wait and RTNL mutex is held
++		 * drop the mutex and hold reference to keep device
++		 */
++		if (req->async == 0) {
++			dev_hold(dev);
++			rtnl_unlock();
++		}
++	}
++
++	mutex_lock(&kni->sync_lock);
++
++	/* Construct data */
++	memcpy(kni->sync_kva, req, sizeof(struct rte_kni_request));
++	num = kni_fifo_put(kni->req_q, &kni->sync_va, 1);
++	if (num < 1) {
++		pr_err("Cannot send to req_q\n");
++		ret = -EBUSY;
++		goto fail;
++	}
++
++	if (bifurcated_support) {
++		/* No result available since request is handled
++		 * asynchronously. set response to success.
++		 */
++		if (req->async != 0) {
++			req->result = 0;
++			goto async;
++		}
++	}
++
++	ret_val = wait_event_interruptible_timeout(kni->wq,
++			kni_fifo_count(kni->resp_q), 3 * HZ);
++	if (signal_pending(current) || ret_val <= 0) {
++		ret = -ETIME;
++		goto fail;
++	}
++	num = kni_fifo_get(kni->resp_q, (void **)&resp_va, 1);
++	if (num != 1 || resp_va != kni->sync_va) {
++		/* This should never happen */
++		pr_err("No data in resp_q\n");
++		ret = -ENODATA;
++		goto fail;
++	}
++
++	memcpy(req, kni->sync_kva, sizeof(struct rte_kni_request));
++async:
++	ret = 0;
++
++fail:
++	mutex_unlock(&kni->sync_lock);
++	if (bifurcated_support) {
++		if (req->async == 0) {
++			rtnl_lock();
++			dev_put(dev);
++		}
++	}
++	return ret;
++}
++
++/*
++ * Open and close
++ */
++static int
++kni_net_open(struct net_device *dev)
++{
++	int ret;
++	struct rte_kni_request req;
++
++	netif_start_queue(dev);
++	if (kni_dflt_carrier == 1)
++		netif_carrier_on(dev);
++	else
++		netif_carrier_off(dev);
++
++	memset(&req, 0, sizeof(req));
++	req.req_id = RTE_KNI_REQ_CFG_NETWORK_IF;
++
++	/* Setting if_up to non-zero means up */
++	req.if_up = 1;
++	ret = kni_net_process_request(dev, &req);
++
++	return (ret == 0) ? req.result : ret;
++}
++
++static int
++kni_net_release(struct net_device *dev)
++{
++	int ret;
++	struct rte_kni_request req;
++
++	netif_stop_queue(dev); /* can't transmit any more */
++	netif_carrier_off(dev);
++
++	memset(&req, 0, sizeof(req));
++	req.req_id = RTE_KNI_REQ_CFG_NETWORK_IF;
++
++	/* Setting if_up to 0 means down */
++	req.if_up = 0;
++
++	if (bifurcated_support) {
++		/* request async because of the deadlock problem */
++		req.async = 1;
++	}
++
++	ret = kni_net_process_request(dev, &req);
++
++	return (ret == 0) ? req.result : ret;
++}
++
++static void
++kni_fifo_trans_pa2va(struct kni_dev *kni,
++	struct rte_kni_fifo *src_pa, struct rte_kni_fifo *dst_va)
++{
++	uint32_t ret, i, num_dst, num_rx;
++	struct rte_kni_mbuf *kva, *prev_kva;
++	int nb_segs;
++	int kva_nb_segs;
++
++	do {
++		num_dst = kni_fifo_free_count(dst_va);
++		if (num_dst == 0)
++			return;
++
++		num_rx = min_t(uint32_t, num_dst, MBUF_BURST_SZ);
++
++		num_rx = kni_fifo_get(src_pa, kni->pa, num_rx);
++		if (num_rx == 0)
++			return;
++
++		for (i = 0; i < num_rx; i++) {
++			kva = get_kva(kni, kni->pa[i]);
++			kni->va[i] = pa2va(kni->pa[i], kva);
++
++			kva_nb_segs = kva->nb_segs;
++			for (nb_segs = 0; nb_segs < kva_nb_segs; nb_segs++) {
++				if (!kva->next)
++					break;
++
++				prev_kva = kva;
++				kva = get_kva(kni, kva->next);
++				/* Convert physical address to virtual address */
++				prev_kva->next = pa2va(prev_kva->next, kva);
++			}
++		}
++
++		ret = kni_fifo_put(dst_va, kni->va, num_rx);
++		if (ret != num_rx) {
++			/* Failing should not happen */
++			pr_err("Fail to enqueue entries into dst_va\n");
++			return;
++		}
++	} while (1);
++}
++
++/* Try to release mbufs when kni release */
++void kni_net_release_fifo_phy(struct kni_dev *kni)
++{
++	/* release rx_q first, because it can't release in userspace */
++	kni_fifo_trans_pa2va(kni, kni->rx_q, kni->free_q);
++	/* release alloc_q for speeding up kni release in userspace */
++	kni_fifo_trans_pa2va(kni, kni->alloc_q, kni->free_q);
++}
++
++/*
++ * Configuration changes (passed on by ifconfig)
++ */
++static int
++kni_net_config(struct net_device *dev, struct ifmap *map)
++{
++	if (dev->flags & IFF_UP) /* can't act on a running interface */
++		return -EBUSY;
++
++	/* ignore other fields */
++	return 0;
++}
++
++/*
++ * Transmit a packet (called by the kernel)
++ */
++static int
++kni_net_tx(struct sk_buff *skb, struct net_device *dev)
++{
++	int len = 0;
++	uint32_t ret;
++	struct kni_dev *kni = netdev_priv(dev);
++	struct rte_kni_mbuf *pkt_kva = NULL;
++	void *pkt_pa = NULL;
++	void *pkt_va = NULL;
++
++	/* save the timestamp */
++#ifdef HAVE_TRANS_START_HELPER
++	netif_trans_update(dev);
++#else
++	dev->trans_start = jiffies;
++#endif
++
++	/* Check if the length of skb is less than mbuf size */
++	if (skb->len > kni->mbuf_size)
++		goto drop;
++
++	/**
++	 * Check if it has at least one free entry in tx_q and
++	 * one entry in alloc_q.
++	 */
++	if (kni_fifo_free_count(kni->tx_q) == 0 ||
++			kni_fifo_count(kni->alloc_q) == 0) {
++		/**
++		 * If no free entry in tx_q or no entry in alloc_q,
++		 * drops skb and goes out.
++		 */
++		goto drop;
++	}
++
++	/* dequeue a mbuf from alloc_q */
++	ret = kni_fifo_get(kni->alloc_q, &pkt_pa, 1);
++	if (likely(ret == 1)) {
++		void *data_kva;
++
++		pkt_kva = get_kva(kni, pkt_pa);
++		data_kva = get_data_kva(kni, pkt_kva);
++		pkt_va = pa2va(pkt_pa, pkt_kva);
++
++		len = skb->len;
++		memcpy(data_kva, skb->data, len);
++		if (unlikely(len < ETH_ZLEN)) {
++			memset(data_kva + len, 0, ETH_ZLEN - len);
++			len = ETH_ZLEN;
++		}
++		pkt_kva->pkt_len = len;
++		pkt_kva->data_len = len;
++
++		/* enqueue mbuf into tx_q */
++		ret = kni_fifo_put(kni->tx_q, &pkt_va, 1);
++		if (unlikely(ret != 1)) {
++			/* Failing should not happen */
++			pr_err("Fail to enqueue mbuf into tx_q\n");
++			goto drop;
++		}
++	} else {
++		/* Failing should not happen */
++		pr_err("Fail to dequeue mbuf from alloc_q\n");
++		goto drop;
++	}
++
++	/* Free skb and update statistics */
++	dev_kfree_skb(skb);
++	dev->stats.tx_bytes += len;
++	dev->stats.tx_packets++;
++
++	return NETDEV_TX_OK;
++
++drop:
++	/* Free skb and update statistics */
++	dev_kfree_skb(skb);
++	dev->stats.tx_dropped++;
++
++	return NETDEV_TX_OK;
++}
++
++/*
++ * RX: normal working mode
++ */
++static void
++kni_net_rx_normal(struct kni_dev *kni)
++{
++	uint32_t ret;
++	uint32_t len;
++	uint32_t i, num_rx, num_fq;
++	struct rte_kni_mbuf *kva, *prev_kva;
++	void *data_kva;
++	struct sk_buff *skb;
++	struct net_device *dev = kni->net_dev;
++
++	/* Get the number of free entries in free_q */
++	num_fq = kni_fifo_free_count(kni->free_q);
++	if (num_fq == 0) {
++		/* No room on the free_q, bail out */
++		return;
++	}
++
++	/* Calculate the number of entries to dequeue from rx_q */
++	num_rx = min_t(uint32_t, num_fq, MBUF_BURST_SZ);
++
++	/* Burst dequeue from rx_q */
++	num_rx = kni_fifo_get(kni->rx_q, kni->pa, num_rx);
++	if (num_rx == 0)
++		return;
++
++	/* Transfer received packets to netif */
++	for (i = 0; i < num_rx; i++) {
++		kva = get_kva(kni, kni->pa[i]);
++		len = kva->pkt_len;
++		data_kva = get_data_kva(kni, kva);
++		kni->va[i] = pa2va(kni->pa[i], kva);
++
++		skb = netdev_alloc_skb(dev, len);
++		if (!skb) {
++			/* Update statistics */
++			dev->stats.rx_dropped++;
++			continue;
++		}
++
++		if (kva->nb_segs == 1) {
++			memcpy(skb_put(skb, len), data_kva, len);
++		} else {
++			int nb_segs;
++			int kva_nb_segs = kva->nb_segs;
++
++			for (nb_segs = 0; nb_segs < kva_nb_segs; nb_segs++) {
++				memcpy(skb_put(skb, kva->data_len),
++					data_kva, kva->data_len);
++
++				if (!kva->next)
++					break;
++
++				prev_kva = kva;
++				kva = get_kva(kni, kva->next);
++				data_kva = kva2data_kva(kva);
++				/* Convert physical address to virtual address */
++				prev_kva->next = pa2va(prev_kva->next, kva);
++			}
++		}
++
++		skb->protocol = eth_type_trans(skb, dev);
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++
++		/* Call netif interface */
++#ifdef HAVE_NETIF_RX_NI
++		netif_rx_ni(skb);
++#else
++		netif_rx(skb);
++#endif
++
++		/* Update statistics */
++		dev->stats.rx_bytes += len;
++		dev->stats.rx_packets++;
++	}
++
++	/* Burst enqueue mbufs into free_q */
++	ret = kni_fifo_put(kni->free_q, kni->va, num_rx);
++	if (ret != num_rx)
++		/* Failing should not happen */
++		pr_err("Fail to enqueue entries into free_q\n");
++}
++
++/*
++ * RX: loopback with enqueue/dequeue fifos.
++ */
++static void
++kni_net_rx_lo_fifo(struct kni_dev *kni)
++{
++	uint32_t ret;
++	uint32_t len;
++	uint32_t i, num, num_rq, num_tq, num_aq, num_fq;
++	struct rte_kni_mbuf *kva, *next_kva;
++	void *data_kva;
++	struct rte_kni_mbuf *alloc_kva;
++	void *alloc_data_kva;
++	struct net_device *dev = kni->net_dev;
++
++	/* Get the number of entries in rx_q */
++	num_rq = kni_fifo_count(kni->rx_q);
++
++	/* Get the number of free entries in tx_q */
++	num_tq = kni_fifo_free_count(kni->tx_q);
++
++	/* Get the number of entries in alloc_q */
++	num_aq = kni_fifo_count(kni->alloc_q);
++
++	/* Get the number of free entries in free_q */
++	num_fq = kni_fifo_free_count(kni->free_q);
++
++	/* Calculate the number of entries to be dequeued from rx_q */
++	num = min(num_rq, num_tq);
++	num = min(num, num_aq);
++	num = min(num, num_fq);
++	num = min_t(uint32_t, num, MBUF_BURST_SZ);
++
++	/* Return if no entry to dequeue from rx_q */
++	if (num == 0)
++		return;
++
++	/* Burst dequeue from rx_q */
++	ret = kni_fifo_get(kni->rx_q, kni->pa, num);
++	if (ret == 0)
++		return; /* Failing should not happen */
++
++	/* Dequeue entries from alloc_q */
++	ret = kni_fifo_get(kni->alloc_q, kni->alloc_pa, num);
++	if (ret) {
++		num = ret;
++		/* Copy mbufs */
++		for (i = 0; i < num; i++) {
++			kva = get_kva(kni, kni->pa[i]);
++			len = kva->data_len;
++			data_kva = get_data_kva(kni, kva);
++			kni->va[i] = pa2va(kni->pa[i], kva);
++
++			while (kva->next) {
++				next_kva = get_kva(kni, kva->next);
++				/* Convert physical address to virtual address */
++				kva->next = pa2va(kva->next, next_kva);
++				kva = next_kva;
++			}
++
++			alloc_kva = get_kva(kni, kni->alloc_pa[i]);
++			alloc_data_kva = get_data_kva(kni, alloc_kva);
++			kni->alloc_va[i] = pa2va(kni->alloc_pa[i], alloc_kva);
++
++			memcpy(alloc_data_kva, data_kva, len);
++			alloc_kva->pkt_len = len;
++			alloc_kva->data_len = len;
++
++			dev->stats.tx_bytes += len;
++			dev->stats.rx_bytes += len;
++		}
++
++		/* Burst enqueue mbufs into tx_q */
++		ret = kni_fifo_put(kni->tx_q, kni->alloc_va, num);
++		if (ret != num)
++			/* Failing should not happen */
++			pr_err("Fail to enqueue mbufs into tx_q\n");
++	}
++
++	/* Burst enqueue mbufs into free_q */
++	ret = kni_fifo_put(kni->free_q, kni->va, num);
++	if (ret != num)
++		/* Failing should not happen */
++		pr_err("Fail to enqueue mbufs into free_q\n");
++
++	/**
++	 * Update statistic, and enqueue/dequeue failure is impossible,
++	 * as all queues are checked at first.
++	 */
++	dev->stats.tx_packets += num;
++	dev->stats.rx_packets += num;
++}
++
++/*
++ * RX: loopback with enqueue/dequeue fifos and sk buffer copies.
++ */
++static void
++kni_net_rx_lo_fifo_skb(struct kni_dev *kni)
++{
++	uint32_t ret;
++	uint32_t len;
++	uint32_t i, num_rq, num_fq, num;
++	struct rte_kni_mbuf *kva, *prev_kva;
++	void *data_kva;
++	struct sk_buff *skb;
++	struct net_device *dev = kni->net_dev;
++
++	/* Get the number of entries in rx_q */
++	num_rq = kni_fifo_count(kni->rx_q);
++
++	/* Get the number of free entries in free_q */
++	num_fq = kni_fifo_free_count(kni->free_q);
++
++	/* Calculate the number of entries to dequeue from rx_q */
++	num = min(num_rq, num_fq);
++	num = min_t(uint32_t, num, MBUF_BURST_SZ);
++
++	/* Return if no entry to dequeue from rx_q */
++	if (num == 0)
++		return;
++
++	/* Burst dequeue mbufs from rx_q */
++	ret = kni_fifo_get(kni->rx_q, kni->pa, num);
++	if (ret == 0)
++		return;
++
++	/* Copy mbufs to sk buffer and then call tx interface */
++	for (i = 0; i < num; i++) {
++		kva = get_kva(kni, kni->pa[i]);
++		len = kva->pkt_len;
++		data_kva = get_data_kva(kni, kva);
++		kni->va[i] = pa2va(kni->pa[i], kva);
++
++		skb = netdev_alloc_skb(dev, len);
++		if (skb) {
++			memcpy(skb_put(skb, len), data_kva, len);
++			skb->ip_summed = CHECKSUM_UNNECESSARY;
++			dev_kfree_skb(skb);
++		}
++
++		/* Simulate real usage, allocate/copy skb twice */
++		skb = netdev_alloc_skb(dev, len);
++		if (skb == NULL) {
++			dev->stats.rx_dropped++;
++			continue;
++		}
++
++		if (kva->nb_segs == 1) {
++			memcpy(skb_put(skb, len), data_kva, len);
++		} else {
++			int nb_segs;
++			int kva_nb_segs = kva->nb_segs;
++
++			for (nb_segs = 0; nb_segs < kva_nb_segs; nb_segs++) {
++				memcpy(skb_put(skb, kva->data_len),
++					data_kva, kva->data_len);
++
++				if (!kva->next)
++					break;
++
++				prev_kva = kva;
++				kva = get_kva(kni, kva->next);
++				data_kva = get_data_kva(kni, kva);
++				/* Convert physical address to virtual address */
++				prev_kva->next = pa2va(prev_kva->next, kva);
++			}
++		}
++
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++
++		dev->stats.rx_bytes += len;
++		dev->stats.rx_packets++;
++
++		/* call tx interface */
++		kni_net_tx(skb, dev);
++	}
++
++	/* enqueue all the mbufs from rx_q into free_q */
++	ret = kni_fifo_put(kni->free_q, kni->va, num);
++	if (ret != num)
++		/* Failing should not happen */
++		pr_err("Fail to enqueue mbufs into free_q\n");
++}
++
++/* rx interface */
++void
++kni_net_rx(struct kni_dev *kni)
++{
++	/**
++	 * It doesn't need to check if it is NULL pointer,
++	 * as it has a default value
++	 */
++	(*kni_net_rx_func)(kni);
++}
++
++/*
++ * Deal with a transmit timeout.
++ */
++#ifdef HAVE_TX_TIMEOUT_TXQUEUE
++static void
++kni_net_tx_timeout(struct net_device *dev, unsigned int txqueue)
++#else
++static void
++kni_net_tx_timeout(struct net_device *dev)
++#endif
++{
++	pr_debug("Transmit timeout at %ld, latency %ld\n", jiffies,
++			jiffies - dev_trans_start(dev));
++
++	dev->stats.tx_errors++;
++	netif_wake_queue(dev);
++}
++
++static int
++kni_net_change_mtu(struct net_device *dev, int new_mtu)
++{
++	int ret;
++	struct rte_kni_request req;
++
++	pr_debug("kni_net_change_mtu new mtu %d to be set\n", new_mtu);
++
++	memset(&req, 0, sizeof(req));
++	req.req_id = RTE_KNI_REQ_CHANGE_MTU;
++	req.new_mtu = new_mtu;
++	ret = kni_net_process_request(dev, &req);
++	if (ret == 0 && req.result == 0)
++		dev->mtu = new_mtu;
++
++	return (ret == 0) ? req.result : ret;
++}
++
++static void
++kni_net_change_rx_flags(struct net_device *netdev, int flags)
++{
++	struct rte_kni_request req;
++
++	memset(&req, 0, sizeof(req));
++
++	if (flags & IFF_ALLMULTI) {
++		req.req_id = RTE_KNI_REQ_CHANGE_ALLMULTI;
++
++		if (netdev->flags & IFF_ALLMULTI)
++			req.allmulti = 1;
++		else
++			req.allmulti = 0;
++	}
++
++	if (flags & IFF_PROMISC) {
++		req.req_id = RTE_KNI_REQ_CHANGE_PROMISC;
++
++		if (netdev->flags & IFF_PROMISC)
++			req.promiscusity = 1;
++		else
++			req.promiscusity = 0;
++	}
++
++	kni_net_process_request(netdev, &req);
++}
++
++/*
++ * Checks if the user space application provided the resp message
++ */
++void
++kni_net_poll_resp(struct kni_dev *kni)
++{
++	if (kni_fifo_count(kni->resp_q))
++		wake_up_interruptible(&kni->wq);
++}
++
++/*
++ *  Fill the eth header
++ */
++static int
++kni_net_header(struct sk_buff *skb, struct net_device *dev,
++		unsigned short type, const void *daddr,
++		const void *saddr, uint32_t len)
++{
++	struct ethhdr *eth = (struct ethhdr *) skb_push(skb, ETH_HLEN);
++
++	memcpy(eth->h_source, saddr ? saddr : dev->dev_addr, dev->addr_len);
++	memcpy(eth->h_dest,   daddr ? daddr : dev->dev_addr, dev->addr_len);
++	eth->h_proto = htons(type);
++
++	return dev->hard_header_len;
++}
++
++/*
++ * Re-fill the eth header
++ */
++#ifdef HAVE_REBUILD_HEADER
++static int
++kni_net_rebuild_header(struct sk_buff *skb)
++{
++	struct net_device *dev = skb->dev;
++	struct ethhdr *eth = (struct ethhdr *) skb->data;
++
++	memcpy(eth->h_source, dev->dev_addr, dev->addr_len);
++	memcpy(eth->h_dest, dev->dev_addr, dev->addr_len);
++
++	return 0;
++}
++#endif /* < 4.1.0  */
++
++/**
++ * kni_net_set_mac - Change the Ethernet Address of the KNI NIC
++ * @netdev: network interface device structure
++ * @p: pointer to an address structure
++ *
++ * Returns 0 on success, negative on failure
++ **/
++static int
++kni_net_set_mac(struct net_device *netdev, void *p)
++{
++	int ret;
++	struct rte_kni_request req;
++	struct sockaddr *addr = p;
++
++	memset(&req, 0, sizeof(req));
++	req.req_id = RTE_KNI_REQ_CHANGE_MAC_ADDR;
++
++	if (!is_valid_ether_addr((unsigned char *)(addr->sa_data)))
++		return -EADDRNOTAVAIL;
++
++	memcpy(req.mac_addr, addr->sa_data, netdev->addr_len);
++#ifdef HAVE_ETH_HW_ADDR_SET
++	eth_hw_addr_set(netdev, addr->sa_data);
++#else
++	memcpy(netdev->dev_addr, addr->sa_data, netdev->addr_len);
++#endif
++
++	ret = kni_net_process_request(netdev, &req);
++
++	return (ret == 0 ? req.result : ret);
++}
++
++#ifdef HAVE_CHANGE_CARRIER_CB
++static int
++kni_net_change_carrier(struct net_device *dev, bool new_carrier)
++{
++	if (new_carrier)
++		netif_carrier_on(dev);
++	else
++		netif_carrier_off(dev);
++	return 0;
++}
++#endif
++
++static const struct header_ops kni_net_header_ops = {
++	.create  = kni_net_header,
++	.parse   = eth_header_parse,
++#ifdef HAVE_REBUILD_HEADER
++	.rebuild = kni_net_rebuild_header,
++#endif /* < 4.1.0  */
++	.cache   = NULL,  /* disable caching */
++};
++
++static const struct net_device_ops kni_net_netdev_ops = {
++	.ndo_open = kni_net_open,
++	.ndo_stop = kni_net_release,
++	.ndo_set_config = kni_net_config,
++	.ndo_change_rx_flags = kni_net_change_rx_flags,
++	.ndo_start_xmit = kni_net_tx,
++	.ndo_change_mtu = kni_net_change_mtu,
++	.ndo_tx_timeout = kni_net_tx_timeout,
++	.ndo_set_mac_address = kni_net_set_mac,
++#ifdef HAVE_CHANGE_CARRIER_CB
++	.ndo_change_carrier = kni_net_change_carrier,
++#endif
++};
++
++static void kni_get_drvinfo(struct net_device *dev,
++			    struct ethtool_drvinfo *info)
++{
++	strlcpy(info->version, KNI_VERSION, sizeof(info->version));
++	strlcpy(info->driver, "kni", sizeof(info->driver));
++}
++
++static const struct ethtool_ops kni_net_ethtool_ops = {
++	.get_drvinfo	= kni_get_drvinfo,
++	.get_link	= ethtool_op_get_link,
++};
++
++void
++kni_net_init(struct net_device *dev)
++{
++	struct kni_dev *kni = netdev_priv(dev);
++
++	init_waitqueue_head(&kni->wq);
++	mutex_init(&kni->sync_lock);
++
++	ether_setup(dev); /* assign some of the fields */
++	dev->netdev_ops      = &kni_net_netdev_ops;
++	dev->header_ops      = &kni_net_header_ops;
++	dev->ethtool_ops     = &kni_net_ethtool_ops;
++	dev->watchdog_timeo = WD_TIMEOUT;
++}
++
++void
++kni_net_config_lo_mode(char *lo_str)
++{
++	if (!lo_str) {
++		pr_debug("loopback disabled");
++		return;
++	}
++
++	if (!strcmp(lo_str, "lo_mode_none"))
++		pr_debug("loopback disabled");
++	else if (!strcmp(lo_str, "lo_mode_fifo")) {
++		pr_debug("loopback mode=lo_mode_fifo enabled");
++		kni_net_rx_func = kni_net_rx_lo_fifo;
++	} else if (!strcmp(lo_str, "lo_mode_fifo_skb")) {
++		pr_debug("loopback mode=lo_mode_fifo_skb enabled");
++		kni_net_rx_func = kni_net_rx_lo_fifo_skb;
++	} else {
++		pr_debug("Unknown loopback parameter, disabled");
++	}
++}
+diff --git a/kni/meson.build b/kni/meson.build
+new file mode 100644
+index 000000000..8a71d8ba6
+--- /dev/null
++++ b/kni/meson.build
+@@ -0,0 +1,16 @@
++# SPDX-License-Identifier: BSD-3-Clause
++# Copyright(c) 2017 Intel Corporation
++
++if is_windows
++    build = false
++    reason = 'not supported on Windows'
++    subdir_done()
++endif
++
++if not is_linux or not dpdk_conf.get('RTE_ARCH_64')
++    build = false
++    reason = 'only supported on 64-bit Linux'
++endif
++sources = files('rte_kni.c')
++headers = files('rte_kni.h', 'rte_kni_common.h')
++deps += ['ethdev', 'pci']
+diff --git a/kni/rte_kni.c b/kni/rte_kni.c
+new file mode 100644
+index 000000000..bfa6a001f
+--- /dev/null
++++ b/kni/rte_kni.c
+@@ -0,0 +1,843 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2014 Intel Corporation
++ */
++
++#ifndef RTE_EXEC_ENV_LINUX
++#error "KNI is not supported"
++#endif
++
++#include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++#include <linux/version.h>
++
++#include <rte_string_fns.h>
++#include <rte_ethdev.h>
++#include <rte_malloc.h>
++#include <rte_log.h>
++#include <rte_kni.h>
++#include <rte_memzone.h>
++#include <rte_tailq.h>
++#include <rte_eal_memconfig.h>
++#include <rte_kni_common.h>
++#include "rte_kni_fifo.h"
++
++#define MAX_MBUF_BURST_NUM            32
++
++/* Maximum number of ring entries */
++#define KNI_FIFO_COUNT_MAX     1024
++#define KNI_FIFO_SIZE          (KNI_FIFO_COUNT_MAX * sizeof(void *) + \
++					sizeof(struct rte_kni_fifo))
++
++#define KNI_REQUEST_MBUF_NUM_MAX      32
++
++#define KNI_MEM_CHECK(cond, fail) do { if (cond) goto fail; } while (0)
++
++#define KNI_MZ_NAME_FMT			"kni_info_%s"
++#define KNI_TX_Q_MZ_NAME_FMT		"kni_tx_%s"
++#define KNI_RX_Q_MZ_NAME_FMT		"kni_rx_%s"
++#define KNI_ALLOC_Q_MZ_NAME_FMT		"kni_alloc_%s"
++#define KNI_FREE_Q_MZ_NAME_FMT		"kni_free_%s"
++#define KNI_REQ_Q_MZ_NAME_FMT		"kni_req_%s"
++#define KNI_RESP_Q_MZ_NAME_FMT		"kni_resp_%s"
++#define KNI_SYNC_ADDR_MZ_NAME_FMT	"kni_sync_%s"
++
++TAILQ_HEAD(rte_kni_list, rte_tailq_entry);
++
++static struct rte_tailq_elem rte_kni_tailq = {
++	.name = "RTE_KNI",
++};
++EAL_REGISTER_TAILQ(rte_kni_tailq)
++
++/**
++ * KNI context
++ */
++struct rte_kni {
++	char name[RTE_KNI_NAMESIZE];        /**< KNI interface name */
++	uint16_t group_id;                  /**< Group ID of KNI devices */
++	uint32_t slot_id;                   /**< KNI pool slot ID */
++	struct rte_mempool *pktmbuf_pool;   /**< pkt mbuf mempool */
++	unsigned int mbuf_size;                 /**< mbuf size */
++
++	const struct rte_memzone *m_tx_q;   /**< TX queue memzone */
++	const struct rte_memzone *m_rx_q;   /**< RX queue memzone */
++	const struct rte_memzone *m_alloc_q;/**< Alloc queue memzone */
++	const struct rte_memzone *m_free_q; /**< Free queue memzone */
++
++	struct rte_kni_fifo *tx_q;          /**< TX queue */
++	struct rte_kni_fifo *rx_q;          /**< RX queue */
++	struct rte_kni_fifo *alloc_q;       /**< Allocated mbufs queue */
++	struct rte_kni_fifo *free_q;        /**< To be freed mbufs queue */
++
++	const struct rte_memzone *m_req_q;  /**< Request queue memzone */
++	const struct rte_memzone *m_resp_q; /**< Response queue memzone */
++	const struct rte_memzone *m_sync_addr;/**< Sync addr memzone */
++
++	/* For request & response */
++	struct rte_kni_fifo *req_q;         /**< Request queue */
++	struct rte_kni_fifo *resp_q;        /**< Response queue */
++	void *sync_addr;                   /**< Req/Resp Mem address */
++
++	struct rte_kni_ops ops;             /**< operations for request */
++};
++
++enum kni_ops_status {
++	KNI_REQ_NO_REGISTER = 0,
++	KNI_REQ_REGISTERED,
++};
++
++static void kni_free_mbufs(struct rte_kni *kni);
++static void kni_allocate_mbufs(struct rte_kni *kni);
++
++static volatile int kni_fd = -1;
++
++/* Shall be called before any allocation happens */
++int
++rte_kni_init(unsigned int max_kni_ifaces __rte_unused)
++{
++	RTE_LOG(WARNING, KNI, "WARNING: KNI is deprecated and will be removed in DPDK 23.11\n");
++
++#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0)
++	if (rte_eal_iova_mode() != RTE_IOVA_PA) {
++		RTE_LOG(ERR, KNI, "KNI requires IOVA as PA\n");
++		return -1;
++	}
++#endif
++
++	/* Check FD and open */
++	if (kni_fd < 0) {
++		kni_fd = open("/dev/" KNI_DEVICE, O_RDWR);
++		if (kni_fd < 0) {
++			RTE_LOG(ERR, KNI,
++				"Can not open /dev/%s\n", KNI_DEVICE);
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++static struct rte_kni *
++__rte_kni_get(const char *name)
++{
++	struct rte_kni *kni;
++	struct rte_tailq_entry *te;
++	struct rte_kni_list *kni_list;
++
++	kni_list = RTE_TAILQ_CAST(rte_kni_tailq.head, rte_kni_list);
++
++	TAILQ_FOREACH(te, kni_list, next) {
++		kni = te->data;
++		if (strncmp(name, kni->name, RTE_KNI_NAMESIZE) == 0)
++			break;
++	}
++
++	if (te == NULL)
++		kni = NULL;
++
++	return kni;
++}
++
++static int
++kni_reserve_mz(struct rte_kni *kni)
++{
++	char mz_name[RTE_MEMZONE_NAMESIZE];
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_TX_Q_MZ_NAME_FMT, kni->name);
++	kni->m_tx_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_tx_q == NULL, tx_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_RX_Q_MZ_NAME_FMT, kni->name);
++	kni->m_rx_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_rx_q == NULL, rx_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_ALLOC_Q_MZ_NAME_FMT, kni->name);
++	kni->m_alloc_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_alloc_q == NULL, alloc_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_FREE_Q_MZ_NAME_FMT, kni->name);
++	kni->m_free_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_free_q == NULL, free_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_REQ_Q_MZ_NAME_FMT, kni->name);
++	kni->m_req_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_req_q == NULL, req_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_RESP_Q_MZ_NAME_FMT, kni->name);
++	kni->m_resp_q = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_resp_q == NULL, resp_q_fail);
++
++	snprintf(mz_name, RTE_MEMZONE_NAMESIZE, KNI_SYNC_ADDR_MZ_NAME_FMT, kni->name);
++	kni->m_sync_addr = rte_memzone_reserve(mz_name, KNI_FIFO_SIZE, SOCKET_ID_ANY,
++			RTE_MEMZONE_IOVA_CONTIG);
++	KNI_MEM_CHECK(kni->m_sync_addr == NULL, sync_addr_fail);
++
++	return 0;
++
++sync_addr_fail:
++	rte_memzone_free(kni->m_resp_q);
++resp_q_fail:
++	rte_memzone_free(kni->m_req_q);
++req_q_fail:
++	rte_memzone_free(kni->m_free_q);
++free_q_fail:
++	rte_memzone_free(kni->m_alloc_q);
++alloc_q_fail:
++	rte_memzone_free(kni->m_rx_q);
++rx_q_fail:
++	rte_memzone_free(kni->m_tx_q);
++tx_q_fail:
++	return -1;
++}
++
++static void
++kni_release_mz(struct rte_kni *kni)
++{
++	rte_memzone_free(kni->m_tx_q);
++	rte_memzone_free(kni->m_rx_q);
++	rte_memzone_free(kni->m_alloc_q);
++	rte_memzone_free(kni->m_free_q);
++	rte_memzone_free(kni->m_req_q);
++	rte_memzone_free(kni->m_resp_q);
++	rte_memzone_free(kni->m_sync_addr);
++}
++
++struct rte_kni *
++rte_kni_alloc(struct rte_mempool *pktmbuf_pool,
++	      const struct rte_kni_conf *conf,
++	      struct rte_kni_ops *ops)
++{
++	int ret;
++	struct rte_kni_device_info dev_info;
++	struct rte_kni *kni;
++	struct rte_tailq_entry *te;
++	struct rte_kni_list *kni_list;
++
++	if (!pktmbuf_pool || !conf || !conf->name[0])
++		return NULL;
++
++	/* Check if KNI subsystem has been initialized */
++	if (kni_fd < 0) {
++		RTE_LOG(ERR, KNI, "KNI subsystem has not been initialized. Invoke rte_kni_init() first\n");
++		return NULL;
++	}
++
++	rte_mcfg_tailq_write_lock();
++
++	kni = __rte_kni_get(conf->name);
++	if (kni != NULL) {
++		RTE_LOG(ERR, KNI, "KNI already exists\n");
++		goto unlock;
++	}
++
++	te = rte_zmalloc("KNI_TAILQ_ENTRY", sizeof(*te), 0);
++	if (te == NULL) {
++		RTE_LOG(ERR, KNI, "Failed to allocate tailq entry\n");
++		goto unlock;
++	}
++
++	kni = rte_zmalloc("KNI", sizeof(struct rte_kni), RTE_CACHE_LINE_SIZE);
++	if (kni == NULL) {
++		RTE_LOG(ERR, KNI, "KNI memory allocation failed\n");
++		goto kni_fail;
++	}
++
++	strlcpy(kni->name, conf->name, RTE_KNI_NAMESIZE);
++
++	if (ops)
++		memcpy(&kni->ops, ops, sizeof(struct rte_kni_ops));
++	else
++		kni->ops.port_id = UINT16_MAX;
++
++	memset(&dev_info, 0, sizeof(dev_info));
++	dev_info.core_id = conf->core_id;
++	dev_info.force_bind = conf->force_bind;
++	dev_info.group_id = conf->group_id;
++	dev_info.mbuf_size = conf->mbuf_size;
++	dev_info.mtu = conf->mtu;
++	dev_info.min_mtu = conf->min_mtu;
++	dev_info.max_mtu = conf->max_mtu;
++
++	memcpy(dev_info.mac_addr, conf->mac_addr, RTE_ETHER_ADDR_LEN);
++
++	strlcpy(dev_info.name, conf->name, RTE_KNI_NAMESIZE);
++
++	ret = kni_reserve_mz(kni);
++	if (ret < 0)
++		goto mz_fail;
++
++	/* TX RING */
++	kni->tx_q = kni->m_tx_q->addr;
++	kni_fifo_init(kni->tx_q, KNI_FIFO_COUNT_MAX);
++	dev_info.tx_phys = kni->m_tx_q->iova;
++
++	/* RX RING */
++	kni->rx_q = kni->m_rx_q->addr;
++	kni_fifo_init(kni->rx_q, KNI_FIFO_COUNT_MAX);
++	dev_info.rx_phys = kni->m_rx_q->iova;
++
++	/* ALLOC RING */
++	kni->alloc_q = kni->m_alloc_q->addr;
++	kni_fifo_init(kni->alloc_q, KNI_FIFO_COUNT_MAX);
++	dev_info.alloc_phys = kni->m_alloc_q->iova;
++
++	/* FREE RING */
++	kni->free_q = kni->m_free_q->addr;
++	kni_fifo_init(kni->free_q, KNI_FIFO_COUNT_MAX);
++	dev_info.free_phys = kni->m_free_q->iova;
++
++	/* Request RING */
++	kni->req_q = kni->m_req_q->addr;
++	kni_fifo_init(kni->req_q, KNI_FIFO_COUNT_MAX);
++	dev_info.req_phys = kni->m_req_q->iova;
++
++	/* Response RING */
++	kni->resp_q = kni->m_resp_q->addr;
++	kni_fifo_init(kni->resp_q, KNI_FIFO_COUNT_MAX);
++	dev_info.resp_phys = kni->m_resp_q->iova;
++
++	/* Req/Resp sync mem area */
++	kni->sync_addr = kni->m_sync_addr->addr;
++	dev_info.sync_va = kni->m_sync_addr->addr;
++	dev_info.sync_phys = kni->m_sync_addr->iova;
++
++	kni->pktmbuf_pool = pktmbuf_pool;
++	kni->group_id = conf->group_id;
++	kni->mbuf_size = conf->mbuf_size;
++
++	dev_info.iova_mode = (rte_eal_iova_mode() == RTE_IOVA_VA) ? 1 : 0;
++
++	ret = ioctl(kni_fd, RTE_KNI_IOCTL_CREATE, &dev_info);
++	if (ret < 0)
++		goto ioctl_fail;
++
++	te->data = kni;
++
++	kni_list = RTE_TAILQ_CAST(rte_kni_tailq.head, rte_kni_list);
++	TAILQ_INSERT_TAIL(kni_list, te, next);
++
++	rte_mcfg_tailq_write_unlock();
++
++	/* Allocate mbufs and then put them into alloc_q */
++	kni_allocate_mbufs(kni);
++
++	return kni;
++
++ioctl_fail:
++	kni_release_mz(kni);
++mz_fail:
++	rte_free(kni);
++kni_fail:
++	rte_free(te);
++unlock:
++	rte_mcfg_tailq_write_unlock();
++
++	return NULL;
++}
++
++static void
++kni_free_fifo(struct rte_kni_fifo *fifo)
++{
++	int ret;
++	struct rte_mbuf *pkt;
++
++	do {
++		ret = kni_fifo_get(fifo, (void **)&pkt, 1);
++		if (ret)
++			rte_pktmbuf_free(pkt);
++	} while (ret);
++}
++
++static void *
++va2pa(struct rte_mbuf *m)
++{
++	return (void *)((unsigned long)m -
++			((unsigned long)m->buf_addr - (unsigned long)rte_mbuf_iova_get(m)));
++}
++
++static void *
++va2pa_all(struct rte_mbuf *mbuf)
++{
++	void *phy_mbuf = va2pa(mbuf);
++	struct rte_mbuf *next = mbuf->next;
++	while (next) {
++		mbuf->next = va2pa(next);
++		mbuf = next;
++		next = mbuf->next;
++	}
++	return phy_mbuf;
++}
++
++static void
++obj_free(struct rte_mempool *mp __rte_unused, void *opaque, void *obj,
++		unsigned obj_idx __rte_unused)
++{
++	struct rte_mbuf *m = obj;
++	void *mbuf_phys = opaque;
++
++	if (va2pa(m) == mbuf_phys)
++		rte_pktmbuf_free(m);
++}
++
++static void
++kni_free_fifo_phy(struct rte_mempool *mp, struct rte_kni_fifo *fifo)
++{
++	void *mbuf_phys;
++	int ret;
++
++	do {
++		ret = kni_fifo_get(fifo, &mbuf_phys, 1);
++		if (ret)
++			rte_mempool_obj_iter(mp, obj_free, mbuf_phys);
++	} while (ret);
++}
++
++int
++rte_kni_release(struct rte_kni *kni)
++{
++	struct rte_tailq_entry *te;
++	struct rte_kni_list *kni_list;
++	struct rte_kni_device_info dev_info;
++	uint32_t retry = 5;
++
++	if (!kni)
++		return -1;
++
++	kni_list = RTE_TAILQ_CAST(rte_kni_tailq.head, rte_kni_list);
++
++	rte_mcfg_tailq_write_lock();
++
++	TAILQ_FOREACH(te, kni_list, next) {
++		if (te->data == kni)
++			break;
++	}
++
++	if (te == NULL)
++		goto unlock;
++
++	strlcpy(dev_info.name, kni->name, sizeof(dev_info.name));
++	if (ioctl(kni_fd, RTE_KNI_IOCTL_RELEASE, &dev_info) < 0) {
++		RTE_LOG(ERR, KNI, "Fail to release kni device\n");
++		goto unlock;
++	}
++
++	TAILQ_REMOVE(kni_list, te, next);
++
++	rte_mcfg_tailq_write_unlock();
++
++	/* mbufs in all fifo should be released, except request/response */
++
++	/* wait until all rxq packets processed by kernel */
++	while (kni_fifo_count(kni->rx_q) && retry--)
++		usleep(1000);
++
++	if (kni_fifo_count(kni->rx_q))
++		RTE_LOG(ERR, KNI, "Fail to free all Rx-q items\n");
++
++	kni_free_fifo_phy(kni->pktmbuf_pool, kni->alloc_q);
++	kni_free_fifo(kni->tx_q);
++	kni_free_fifo(kni->free_q);
++
++	kni_release_mz(kni);
++
++	rte_free(kni);
++
++	rte_free(te);
++
++	return 0;
++
++unlock:
++	rte_mcfg_tailq_write_unlock();
++
++	return -1;
++}
++
++/* default callback for request of configuring device mac address */
++static int
++kni_config_mac_address(uint16_t port_id, uint8_t mac_addr[])
++{
++	int ret = 0;
++
++	if (!rte_eth_dev_is_valid_port(port_id)) {
++		RTE_LOG(ERR, KNI, "Invalid port id %d\n", port_id);
++		return -EINVAL;
++	}
++
++	RTE_LOG(INFO, KNI, "Configure mac address of %d", port_id);
++
++	ret = rte_eth_dev_default_mac_addr_set(port_id,
++					(struct rte_ether_addr *)mac_addr);
++	if (ret < 0)
++		RTE_LOG(ERR, KNI, "Failed to config mac_addr for port %d\n",
++			port_id);
++
++	return ret;
++}
++
++/* default callback for request of configuring promiscuous mode */
++static int
++kni_config_promiscusity(uint16_t port_id, uint8_t to_on)
++{
++	int ret;
++
++	if (!rte_eth_dev_is_valid_port(port_id)) {
++		RTE_LOG(ERR, KNI, "Invalid port id %d\n", port_id);
++		return -EINVAL;
++	}
++
++	RTE_LOG(INFO, KNI, "Configure promiscuous mode of %d to %d\n",
++		port_id, to_on);
++
++	if (to_on)
++		ret = rte_eth_promiscuous_enable(port_id);
++	else
++		ret = rte_eth_promiscuous_disable(port_id);
++
++	if (ret != 0)
++		RTE_LOG(ERR, KNI,
++			"Failed to %s promiscuous mode for port %u: %s\n",
++			to_on ? "enable" : "disable", port_id,
++			rte_strerror(-ret));
++
++	return ret;
++}
++
++/* default callback for request of configuring allmulticast mode */
++static int
++kni_config_allmulticast(uint16_t port_id, uint8_t to_on)
++{
++	int ret;
++
++	if (!rte_eth_dev_is_valid_port(port_id)) {
++		RTE_LOG(ERR, KNI, "Invalid port id %d\n", port_id);
++		return -EINVAL;
++	}
++
++	RTE_LOG(INFO, KNI, "Configure allmulticast mode of %d to %d\n",
++		port_id, to_on);
++
++	if (to_on)
++		ret = rte_eth_allmulticast_enable(port_id);
++	else
++		ret = rte_eth_allmulticast_disable(port_id);
++	if (ret != 0)
++		RTE_LOG(ERR, KNI,
++			"Failed to %s allmulticast mode for port %u: %s\n",
++			to_on ? "enable" : "disable", port_id,
++			rte_strerror(-ret));
++
++	return ret;
++}
++
++int
++rte_kni_handle_request(struct rte_kni *kni)
++{
++	unsigned int ret;
++	struct rte_kni_request *req = NULL;
++
++	if (kni == NULL)
++		return -1;
++
++	/* Get request mbuf */
++	ret = kni_fifo_get(kni->req_q, (void **)&req, 1);
++	if (ret != 1)
++		return 0; /* It is OK of can not getting the request mbuf */
++
++	if (req != kni->sync_addr) {
++		RTE_LOG(ERR, KNI, "Wrong req pointer %p\n", req);
++		return -1;
++	}
++
++	/* Analyze the request and call the relevant actions for it */
++	switch (req->req_id) {
++	case RTE_KNI_REQ_CHANGE_MTU: /* Change MTU */
++		if (kni->ops.change_mtu)
++			req->result = kni->ops.change_mtu(kni->ops.port_id,
++							req->new_mtu);
++		break;
++	case RTE_KNI_REQ_CFG_NETWORK_IF: /* Set network interface up/down */
++		if (kni->ops.config_network_if)
++			req->result = kni->ops.config_network_if(kni->ops.port_id,
++								 req->if_up);
++		break;
++	case RTE_KNI_REQ_CHANGE_MAC_ADDR: /* Change MAC Address */
++		if (kni->ops.config_mac_address)
++			req->result = kni->ops.config_mac_address(
++					kni->ops.port_id, req->mac_addr);
++		else if (kni->ops.port_id != UINT16_MAX)
++			req->result = kni_config_mac_address(
++					kni->ops.port_id, req->mac_addr);
++		break;
++	case RTE_KNI_REQ_CHANGE_PROMISC: /* Change PROMISCUOUS MODE */
++		if (kni->ops.config_promiscusity)
++			req->result = kni->ops.config_promiscusity(
++					kni->ops.port_id, req->promiscusity);
++		else if (kni->ops.port_id != UINT16_MAX)
++			req->result = kni_config_promiscusity(
++					kni->ops.port_id, req->promiscusity);
++		break;
++	case RTE_KNI_REQ_CHANGE_ALLMULTI: /* Change ALLMULTICAST MODE */
++		if (kni->ops.config_allmulticast)
++			req->result = kni->ops.config_allmulticast(
++					kni->ops.port_id, req->allmulti);
++		else if (kni->ops.port_id != UINT16_MAX)
++			req->result = kni_config_allmulticast(
++					kni->ops.port_id, req->allmulti);
++		break;
++	default:
++		RTE_LOG(ERR, KNI, "Unknown request id %u\n", req->req_id);
++		req->result = -EINVAL;
++		break;
++	}
++
++	/* if needed, construct response buffer and put it back to resp_q */
++	if (!req->async)
++		ret = kni_fifo_put(kni->resp_q, (void **)&req, 1);
++	else
++		ret = 1;
++	if (ret != 1) {
++		RTE_LOG(ERR, KNI, "Fail to put the muf back to resp_q\n");
++		return -1; /* It is an error of can't putting the mbuf back */
++	}
++
++	return 0;
++}
++
++unsigned
++rte_kni_tx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs, unsigned int num)
++{
++	num = RTE_MIN(kni_fifo_free_count(kni->rx_q), num);
++	void *phy_mbufs[num];
++	unsigned int ret;
++	unsigned int i;
++
++	for (i = 0; i < num; i++)
++		phy_mbufs[i] = va2pa_all(mbufs[i]);
++
++	ret = kni_fifo_put(kni->rx_q, phy_mbufs, num);
++
++	/* Get mbufs from free_q and then free them */
++	kni_free_mbufs(kni);
++
++	return ret;
++}
++
++unsigned
++rte_kni_rx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs, unsigned int num)
++{
++	unsigned int ret = kni_fifo_get(kni->tx_q, (void **)mbufs, num);
++
++	/* If buffers removed or alloc_q is empty, allocate mbufs and then put them into alloc_q */
++	if (ret || (kni_fifo_count(kni->alloc_q) == 0))
++		kni_allocate_mbufs(kni);
++
++	return ret;
++}
++
++static void
++kni_free_mbufs(struct rte_kni *kni)
++{
++	int i, ret;
++	struct rte_mbuf *pkts[MAX_MBUF_BURST_NUM];
++
++	ret = kni_fifo_get(kni->free_q, (void **)pkts, MAX_MBUF_BURST_NUM);
++	if (likely(ret > 0)) {
++		for (i = 0; i < ret; i++)
++			rte_pktmbuf_free(pkts[i]);
++	}
++}
++
++static void
++kni_allocate_mbufs(struct rte_kni *kni)
++{
++	int i, ret;
++	struct rte_mbuf *pkts[MAX_MBUF_BURST_NUM];
++	void *phys[MAX_MBUF_BURST_NUM];
++	int allocq_free;
++
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, pool) !=
++			 offsetof(struct rte_kni_mbuf, pool));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, buf_addr) !=
++			 offsetof(struct rte_kni_mbuf, buf_addr));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, next) !=
++			 offsetof(struct rte_kni_mbuf, next));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, data_off) !=
++			 offsetof(struct rte_kni_mbuf, data_off));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, data_len) !=
++			 offsetof(struct rte_kni_mbuf, data_len));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, pkt_len) !=
++			 offsetof(struct rte_kni_mbuf, pkt_len));
++	RTE_BUILD_BUG_ON(offsetof(struct rte_mbuf, ol_flags) !=
++			 offsetof(struct rte_kni_mbuf, ol_flags));
++
++	/* Check if pktmbuf pool has been configured */
++	if (kni->pktmbuf_pool == NULL) {
++		RTE_LOG(ERR, KNI, "No valid mempool for allocating mbufs\n");
++		return;
++	}
++
++	allocq_free = kni_fifo_free_count(kni->alloc_q);
++	allocq_free = (allocq_free > MAX_MBUF_BURST_NUM) ?
++		MAX_MBUF_BURST_NUM : allocq_free;
++	for (i = 0; i < allocq_free; i++) {
++		pkts[i] = rte_pktmbuf_alloc(kni->pktmbuf_pool);
++		if (unlikely(pkts[i] == NULL)) {
++			/* Out of memory */
++			RTE_LOG(ERR, KNI, "Out of memory\n");
++			break;
++		}
++		phys[i] = va2pa(pkts[i]);
++	}
++
++	/* No pkt mbuf allocated */
++	if (i <= 0)
++		return;
++
++	ret = kni_fifo_put(kni->alloc_q, phys, i);
++
++	/* Check if any mbufs not put into alloc_q, and then free them */
++	if (ret >= 0 && ret < i && ret < MAX_MBUF_BURST_NUM) {
++		int j;
++
++		for (j = ret; j < i; j++)
++			rte_pktmbuf_free(pkts[j]);
++	}
++}
++
++struct rte_kni *
++rte_kni_get(const char *name)
++{
++	struct rte_kni *kni;
++
++	if (name == NULL || name[0] == '\0')
++		return NULL;
++
++	rte_mcfg_tailq_read_lock();
++
++	kni = __rte_kni_get(name);
++
++	rte_mcfg_tailq_read_unlock();
++
++	return kni;
++}
++
++const char *
++rte_kni_get_name(const struct rte_kni *kni)
++{
++	return kni->name;
++}
++
++static enum kni_ops_status
++kni_check_request_register(struct rte_kni_ops *ops)
++{
++	/* check if KNI request ops has been registered*/
++	if (ops == NULL)
++		return KNI_REQ_NO_REGISTER;
++
++	if (ops->change_mtu == NULL
++	    && ops->config_network_if == NULL
++	    && ops->config_mac_address == NULL
++	    && ops->config_promiscusity == NULL
++	    && ops->config_allmulticast == NULL)
++		return KNI_REQ_NO_REGISTER;
++
++	return KNI_REQ_REGISTERED;
++}
++
++int
++rte_kni_register_handlers(struct rte_kni *kni, struct rte_kni_ops *ops)
++{
++	enum kni_ops_status req_status;
++
++	if (ops == NULL) {
++		RTE_LOG(ERR, KNI, "Invalid KNI request operation.\n");
++		return -1;
++	}
++
++	if (kni == NULL) {
++		RTE_LOG(ERR, KNI, "Invalid kni info.\n");
++		return -1;
++	}
++
++	req_status = kni_check_request_register(&kni->ops);
++	if (req_status == KNI_REQ_REGISTERED) {
++		RTE_LOG(ERR, KNI, "The KNI request operation has already registered.\n");
++		return -1;
++	}
++
++	memcpy(&kni->ops, ops, sizeof(struct rte_kni_ops));
++	return 0;
++}
++
++int
++rte_kni_unregister_handlers(struct rte_kni *kni)
++{
++	if (kni == NULL) {
++		RTE_LOG(ERR, KNI, "Invalid kni info.\n");
++		return -1;
++	}
++
++	memset(&kni->ops, 0, sizeof(struct rte_kni_ops));
++
++	return 0;
++}
++
++int
++rte_kni_update_link(struct rte_kni *kni, unsigned int linkup)
++{
++	char path[64];
++	char old_carrier[2];
++	const char *new_carrier;
++	int old_linkup;
++	int fd, ret;
++
++	if (kni == NULL)
++		return -1;
++
++	snprintf(path, sizeof(path), "/sys/devices/virtual/net/%s/carrier",
++		kni->name);
++
++	fd = open(path, O_RDWR);
++	if (fd == -1) {
++		RTE_LOG(ERR, KNI, "Failed to open file: %s.\n", path);
++		return -1;
++	}
++
++	ret = read(fd, old_carrier, 2);
++	if (ret < 1) {
++		close(fd);
++		return -1;
++	}
++	old_linkup = (old_carrier[0] == '1');
++
++	if (old_linkup == (int)linkup)
++		goto out;
++
++	new_carrier = linkup ? "1" : "0";
++	ret = write(fd, new_carrier, 1);
++	if (ret < 1) {
++		RTE_LOG(ERR, KNI, "Failed to write file: %s.\n", path);
++		close(fd);
++		return -1;
++	}
++out:
++	close(fd);
++	return old_linkup;
++}
++
++void
++rte_kni_close(void)
++{
++	if (kni_fd < 0)
++		return;
++
++	close(kni_fd);
++	kni_fd = -1;
++}
+diff --git a/kni/rte_kni.h b/kni/rte_kni.h
+new file mode 100644
+index 000000000..1e508acc8
+--- /dev/null
++++ b/kni/rte_kni.h
+@@ -0,0 +1,269 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2014 Intel Corporation
++ */
++
++#ifndef _RTE_KNI_H_
++#define _RTE_KNI_H_
++
++/**
++ * @file
++ * RTE KNI
++ *
++ * The KNI library provides the ability to create and destroy kernel NIC
++ * interfaces that may be used by the RTE application to receive/transmit
++ * packets from/to Linux kernel net interfaces.
++ *
++ * This library provides two APIs to burst receive packets from KNI interfaces,
++ * and burst transmit packets to KNI interfaces.
++ */
++
++#include <rte_compat.h>
++#include <rte_pci.h>
++#include <rte_ether.h>
++
++#include <rte_kni_common.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct rte_kni;
++struct rte_mbuf;
++
++/**
++ * Structure which has the function pointers for KNI interface.
++ */
++struct rte_kni_ops {
++	uint16_t port_id; /* Port ID */
++
++	/* Pointer to function of changing MTU */
++	int (*change_mtu)(uint16_t port_id, unsigned int new_mtu);
++
++	/* Pointer to function of configuring network interface */
++	int (*config_network_if)(uint16_t port_id, uint8_t if_up);
++
++	/* Pointer to function of configuring mac address */
++	int (*config_mac_address)(uint16_t port_id, uint8_t mac_addr[]);
++
++	/* Pointer to function of configuring promiscuous mode */
++	int (*config_promiscusity)(uint16_t port_id, uint8_t to_on);
++
++	/* Pointer to function of configuring allmulticast mode */
++	int (*config_allmulticast)(uint16_t port_id, uint8_t to_on);
++};
++
++/**
++ * Structure for configuring KNI device.
++ */
++struct rte_kni_conf {
++	/*
++	 * KNI name which will be used in relevant network device.
++	 * Let the name as short as possible, as it will be part of
++	 * memzone name.
++	 */
++	char name[RTE_KNI_NAMESIZE];
++	uint32_t core_id;   /* Core ID to bind kernel thread on */
++	uint16_t group_id;  /* Group ID */
++	unsigned mbuf_size; /* mbuf size */
++	struct rte_pci_addr addr; /* deprecated */
++	struct rte_pci_id id; /* deprecated */
++
++	__extension__
++	uint8_t force_bind : 1; /* Flag to bind kernel thread */
++	uint8_t mac_addr[RTE_ETHER_ADDR_LEN]; /* MAC address assigned to KNI */
++	uint16_t mtu;
++	uint16_t min_mtu;
++	uint16_t max_mtu;
++};
++
++/**
++ * Initialize and preallocate KNI subsystem
++ *
++ * This function is to be executed on the main lcore only, after EAL
++ * initialization and before any KNI interface is attempted to be
++ * allocated
++ *
++ * @param max_kni_ifaces
++ *  The maximum number of KNI interfaces that can coexist concurrently
++ *
++ * @return
++ *  - 0 indicates success.
++ *  - negative value indicates failure.
++ */
++int rte_kni_init(unsigned int max_kni_ifaces);
++
++
++/**
++ * Allocate KNI interface according to the port id, mbuf size, mbuf pool,
++ * configurations and callbacks for kernel requests.The KNI interface created
++ * in the kernel space is the net interface the traditional Linux application
++ * talking to.
++ *
++ * The rte_kni_alloc shall not be called before rte_kni_init() has been
++ * called. rte_kni_alloc is thread safe.
++ *
++ * The mempool should have capacity of more than "2 x KNI_FIFO_COUNT_MAX"
++ * elements for each KNI interface allocated.
++ *
++ * @param pktmbuf_pool
++ *  The mempool for allocating mbufs for packets.
++ * @param conf
++ *  The pointer to the configurations of the KNI device.
++ * @param ops
++ *  The pointer to the callbacks for the KNI kernel requests.
++ *
++ * @return
++ *  - The pointer to the context of a KNI interface.
++ *  - NULL indicate error.
++ */
++struct rte_kni *rte_kni_alloc(struct rte_mempool *pktmbuf_pool,
++		const struct rte_kni_conf *conf, struct rte_kni_ops *ops);
++
++/**
++ * Release KNI interface according to the context. It will also release the
++ * paired KNI interface in kernel space. All processing on the specific KNI
++ * context need to be stopped before calling this interface.
++ *
++ * rte_kni_release is thread safe.
++ *
++ * @param kni
++ *  The pointer to the context of an existent KNI interface.
++ *
++ * @return
++ *  - 0 indicates success.
++ *  - negative value indicates failure.
++ */
++int rte_kni_release(struct rte_kni *kni);
++
++/**
++ * It is used to handle the request mbufs sent from kernel space.
++ * Then analyzes it and calls the specific actions for the specific requests.
++ * Finally constructs the response mbuf and puts it back to the resp_q.
++ *
++ * @param kni
++ *  The pointer to the context of an existent KNI interface.
++ *
++ * @return
++ *  - 0
++ *  - negative value indicates failure.
++ */
++int rte_kni_handle_request(struct rte_kni *kni);
++
++/**
++ * Retrieve a burst of packets from a KNI interface. The retrieved packets are
++ * stored in rte_mbuf structures whose pointers are supplied in the array of
++ * mbufs, and the maximum number is indicated by num. It handles allocating
++ * the mbufs for KNI interface alloc queue.
++ *
++ * @param kni
++ *  The KNI interface context.
++ * @param mbufs
++ *  The array to store the pointers of mbufs.
++ * @param num
++ *  The maximum number per burst.
++ *
++ * @return
++ *  The actual number of packets retrieved.
++ */
++unsigned rte_kni_rx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs,
++		unsigned num);
++
++/**
++ * Send a burst of packets to a KNI interface. The packets to be sent out are
++ * stored in rte_mbuf structures whose pointers are supplied in the array of
++ * mbufs, and the maximum number is indicated by num. It handles the freeing of
++ * the mbufs in the free queue of KNI interface.
++ *
++ * @param kni
++ *  The KNI interface context.
++ * @param mbufs
++ *  The array to store the pointers of mbufs.
++ * @param num
++ *  The maximum number per burst.
++ *
++ * @return
++ *  The actual number of packets sent.
++ */
++unsigned rte_kni_tx_burst(struct rte_kni *kni, struct rte_mbuf **mbufs,
++		unsigned num);
++
++/**
++ * Get the KNI context of its name.
++ *
++ * @param name
++ *  pointer to the KNI device name.
++ *
++ * @return
++ *  On success: Pointer to KNI interface.
++ *  On failure: NULL.
++ */
++struct rte_kni *rte_kni_get(const char *name);
++
++/**
++ * Get the name given to a KNI device
++ *
++ * @param kni
++ *   The KNI instance to query
++ * @return
++ *   The pointer to the KNI name
++ */
++const char *rte_kni_get_name(const struct rte_kni *kni);
++
++/**
++ * Register KNI request handling for a specified port,and it can
++ * be called by primary process or secondary process.
++ *
++ * @param kni
++ *  pointer to struct rte_kni.
++ * @param ops
++ *  pointer to struct rte_kni_ops.
++ *
++ * @return
++ *  On success: 0
++ *  On failure: -1
++ */
++int rte_kni_register_handlers(struct rte_kni *kni, struct rte_kni_ops *ops);
++
++/**
++ *  Unregister KNI request handling for a specified port.
++ *
++ *  @param kni
++ *   pointer to struct rte_kni.
++ *
++ *  @return
++ *   On success: 0
++ *   On failure: -1
++ */
++int rte_kni_unregister_handlers(struct rte_kni *kni);
++
++/**
++ * Update link carrier state for KNI port.
++ *
++ * Update the linkup/linkdown state of a KNI interface in the kernel.
++ *
++ * @param kni
++ *  pointer to struct rte_kni.
++ * @param linkup
++ *  New link state:
++ *  0 for linkdown.
++ *  > 0 for linkup.
++ *
++ * @return
++ *  On failure: -1
++ *  Previous link state == linkdown: 0
++ *  Previous link state == linkup: 1
++ */
++__rte_experimental
++int
++rte_kni_update_link(struct rte_kni *kni, unsigned int linkup);
++
++/**
++ *  Close KNI device.
++ */
++void rte_kni_close(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _RTE_KNI_H_ */
+diff --git a/kni/rte_kni_common.h b/kni/rte_kni_common.h
+new file mode 100644
+index 000000000..1554eb47b
+--- /dev/null
++++ b/kni/rte_kni_common.h
+@@ -0,0 +1,149 @@
++/* SPDX-License-Identifier: (BSD-3-Clause OR LGPL-2.1) */
++/*
++ * Copyright(c) 2007-2014 Intel Corporation.
++ */
++
++#ifndef _RTE_KNI_COMMON_H_
++#define _RTE_KNI_COMMON_H_
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifdef __KERNEL__
++#include <linux/if.h>
++#include <asm/barrier.h>
++#define RTE_STD_C11
++#else
++#include <rte_common.h>
++#include <rte_config.h>
++#endif
++
++#define	RTE_CACHE_LINE_SIZE 1 << 6
++
++/*
++ * KNI name is part of memzone name. Must not exceed IFNAMSIZ.
++ */
++#define RTE_KNI_NAMESIZE 16
++
++#define RTE_CACHE_LINE_MIN_SIZE 64
++
++/*
++ * Request id.
++ */
++enum rte_kni_req_id {
++	RTE_KNI_REQ_UNKNOWN = 0,
++	RTE_KNI_REQ_CHANGE_MTU,
++	RTE_KNI_REQ_CFG_NETWORK_IF,
++	RTE_KNI_REQ_CHANGE_MAC_ADDR,
++	RTE_KNI_REQ_CHANGE_PROMISC,
++	RTE_KNI_REQ_CHANGE_ALLMULTI,
++	RTE_KNI_REQ_MAX,
++};
++
++/*
++ * Structure for KNI request.
++ */
++struct rte_kni_request {
++	uint32_t req_id;             /**< Request id */
++	RTE_STD_C11
++	union {
++		uint32_t new_mtu;    /**< New MTU */
++		uint8_t if_up;       /**< 1: interface up, 0: interface down */
++		uint8_t mac_addr[6]; /**< MAC address for interface */
++		uint8_t promiscusity;/**< 1: promisc mode enable, 0: disable */
++		uint8_t allmulti;    /**< 1: all-multicast mode enable, 0: disable */
++	};
++	int32_t async : 1;            /**< 1: request is asynchronous */
++	int32_t result;               /**< Result for processing request */
++} __attribute__((__packed__));
++
++/*
++ * Fifo struct mapped in a shared memory. It describes a circular buffer FIFO
++ * Write and read should wrap around. Fifo is empty when write == read
++ * Writing should never overwrite the read position
++ */
++struct rte_kni_fifo {
++#ifdef RTE_USE_C11_MEM_MODEL
++	unsigned write;              /**< Next position to be written*/
++	unsigned read;               /**< Next position to be read */
++#else
++	volatile unsigned write;     /**< Next position to be written*/
++	volatile unsigned read;      /**< Next position to be read */
++#endif
++	unsigned len;                /**< Circular buffer length */
++	unsigned elem_size;          /**< Pointer size - for 32/64 bit OS */
++	void *volatile buffer[];     /**< The buffer contains mbuf pointers */
++};
++
++/*
++ * The kernel image of the rte_mbuf struct, with only the relevant fields.
++ * Padding is necessary to assure the offsets of these fields
++ */
++struct rte_kni_mbuf {
++	void *buf_addr __attribute__((__aligned__(RTE_CACHE_LINE_SIZE)));
++	uint64_t buf_iova;
++	uint16_t data_off;      /**< Start address of data in segment buffer. */
++	char pad1[2];
++	uint16_t nb_segs;       /**< Number of segments. */
++	char pad4[2];
++	uint64_t ol_flags;      /**< Offload features. */
++	char pad2[4];
++	uint32_t pkt_len;       /**< Total pkt len: sum of all segment data_len. */
++	uint16_t data_len;      /**< Amount of data in segment buffer. */
++	char pad3[14];
++	void *pool;
++
++	/* fields on second cache line */
++	__attribute__((__aligned__(RTE_CACHE_LINE_MIN_SIZE)))
++	void *next;             /**< Physical address of next mbuf in kernel. */
++};
++
++/*
++ * Struct used to create a KNI device. Passed to the kernel in IOCTL call
++ */
++
++struct rte_kni_device_info {
++	char name[RTE_KNI_NAMESIZE];  /**< Network device name for KNI */
++
++	phys_addr_t tx_phys;
++	phys_addr_t rx_phys;
++	phys_addr_t alloc_phys;
++	phys_addr_t free_phys;
++
++	/* Used by Ethtool */
++	phys_addr_t req_phys;
++	phys_addr_t resp_phys;
++	phys_addr_t sync_phys;
++	void * sync_va;
++
++	/* mbuf mempool */
++	void * mbuf_va;
++	phys_addr_t mbuf_phys;
++
++	uint16_t group_id;            /**< Group ID */
++	uint32_t core_id;             /**< core ID to bind for kernel thread */
++
++	__extension__
++	uint8_t force_bind : 1;       /**< Flag for kernel thread binding */
++
++	/* mbuf size */
++	unsigned mbuf_size;
++	unsigned int mtu;
++	unsigned int min_mtu;
++	unsigned int max_mtu;
++	uint8_t mac_addr[6];
++	uint8_t iova_mode;
++};
++
++#define KNI_DEVICE "kni"
++
++#define RTE_KNI_IOCTL_TEST    _IOWR(0, 1, int)
++#define RTE_KNI_IOCTL_CREATE  _IOWR(0, 2, struct rte_kni_device_info)
++#define RTE_KNI_IOCTL_RELEASE _IOWR(0, 3, struct rte_kni_device_info)
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* _RTE_KNI_COMMON_H_ */
+diff --git a/kni/rte_kni_fifo.h b/kni/rte_kni_fifo.h
+new file mode 100644
+index 000000000..d2ec82fe8
+--- /dev/null
++++ b/kni/rte_kni_fifo.h
+@@ -0,0 +1,117 @@
++/* SPDX-License-Identifier: BSD-3-Clause
++ * Copyright(c) 2010-2014 Intel Corporation
++ */
++
++
++
++/**
++ * @internal when c11 memory model enabled use c11 atomic memory barrier.
++ * when under non c11 memory model use rte_smp_* memory barrier.
++ *
++ * @param src
++ *   Pointer to the source data.
++ * @param dst
++ *   Pointer to the destination data.
++ * @param value
++ *   Data value.
++ */
++#ifdef RTE_USE_C11_MEM_MODEL
++#define __KNI_LOAD_ACQUIRE(src) ({                         \
++		__atomic_load_n((src), __ATOMIC_ACQUIRE);           \
++	})
++#define __KNI_STORE_RELEASE(dst, value) do {               \
++		__atomic_store_n((dst), value, __ATOMIC_RELEASE);   \
++	} while(0)
++#else
++#define __KNI_LOAD_ACQUIRE(src) ({                         \
++		typeof (*(src)) val = *(src);                       \
++		rte_smp_rmb();                                      \
++		val;                                                \
++	})
++#define __KNI_STORE_RELEASE(dst, value) do {               \
++		*(dst) = value;                                     \
++		rte_smp_wmb();                                      \
++	} while(0)
++#endif
++
++/**
++ * Initializes the kni fifo structure
++ */
++static void
++kni_fifo_init(struct rte_kni_fifo *fifo, unsigned size)
++{
++	/* Ensure size is power of 2 */
++	if (size & (size - 1))
++		rte_panic("KNI fifo size must be power of 2\n");
++
++	fifo->write = 0;
++	fifo->read = 0;
++	fifo->len = size;
++	fifo->elem_size = sizeof(void *);
++}
++
++/**
++ * Adds num elements into the fifo. Return the number actually written
++ */
++static inline unsigned
++kni_fifo_put(struct rte_kni_fifo *fifo, void **data, unsigned num)
++{
++	unsigned i = 0;
++	unsigned fifo_write = fifo->write;
++	unsigned new_write = fifo_write;
++	unsigned fifo_read = __KNI_LOAD_ACQUIRE(&fifo->read);
++
++	for (i = 0; i < num; i++) {
++		new_write = (new_write + 1) & (fifo->len - 1);
++
++		if (new_write == fifo_read)
++			break;
++		fifo->buffer[fifo_write] = data[i];
++		fifo_write = new_write;
++	}
++	__KNI_STORE_RELEASE(&fifo->write, fifo_write);
++	return i;
++}
++
++/**
++ * Get up to num elements from the fifo. Return the number actually read
++ */
++static inline unsigned
++kni_fifo_get(struct rte_kni_fifo *fifo, void **data, unsigned num)
++{
++	unsigned i = 0;
++	unsigned new_read = fifo->read;
++	unsigned fifo_write = __KNI_LOAD_ACQUIRE(&fifo->write);
++
++	for (i = 0; i < num; i++) {
++		if (new_read == fifo_write)
++			break;
++
++		data[i] = fifo->buffer[new_read];
++		new_read = (new_read + 1) & (fifo->len - 1);
++	}
++	__KNI_STORE_RELEASE(&fifo->read, new_read);
++	return i;
++}
++
++/**
++ * Get the num of elements in the fifo
++ */
++static inline uint32_t
++kni_fifo_count(struct rte_kni_fifo *fifo)
++{
++	unsigned fifo_write = __KNI_LOAD_ACQUIRE(&fifo->write);
++	unsigned fifo_read = __KNI_LOAD_ACQUIRE(&fifo->read);
++	return (fifo->len + fifo_write - fifo_read) & (fifo->len - 1);
++}
++
++/**
++ * Get the num of available elements in the fifo
++ */
++static inline uint32_t
++kni_fifo_free_count(struct rte_kni_fifo *fifo)
++{
++	uint32_t fifo_write = __KNI_LOAD_ACQUIRE(&fifo->write);
++	uint32_t fifo_read = __KNI_LOAD_ACQUIRE(&fifo->read);
++	return (fifo_read - fifo_write - 1) & (fifo->len - 1);
++}
+diff --git a/kni/version.map b/kni/version.map
+new file mode 100644
+index 000000000..83bbbe880
+--- /dev/null
++++ b/kni/version.map
+@@ -0,0 +1,24 @@
++DPDK_23 {
++	global:
++
++	rte_kni_alloc;
++	rte_kni_close;
++	rte_kni_get;
++	rte_kni_get_name;
++	rte_kni_handle_request;
++	rte_kni_init;
++	rte_kni_register_handlers;
++	rte_kni_release;
++	rte_kni_rx_burst;
++	rte_kni_tx_burst;
++	rte_kni_unregister_handlers;
++
++	local: *;
++};
++
++EXPERIMENTAL {
++	global:
++
++	# updated in v21.08
++	rte_kni_update_link;
++};
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index c3ca28ca6..265e2b3df 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -180,7 +180,9 @@ static int copyin(void *to, const void __user *from, size_t n)
+ 		return n;
+ 	if (access_ok(from, n)) {
+ 		instrument_copy_from_user_before(to, from, n);
++
+ 		res = raw_copy_from_user(to, from, n);
++
+ 		instrument_copy_from_user_after(to, from, n, res);
+ 	}
+ 	return res;
+diff --git a/lib/strncpy_from_user.c b/lib/strncpy_from_user.c
+index 6432b8c3e..a8874471e 100644
+--- a/lib/strncpy_from_user.c
++++ b/lib/strncpy_from_user.c
+@@ -9,6 +9,7 @@
+ #include <linux/errno.h>
+ #include <linux/mm.h>
+ 
++#include <asm/kernel_rr.h>
+ #include <asm/byteorder.h>
+ #include <asm/word-at-a-time.h>
+ 
+diff --git a/lib/usercopy.c b/lib/usercopy.c
+index 1505a52f2..cad18f294 100644
+--- a/lib/usercopy.c
++++ b/lib/usercopy.c
+@@ -13,7 +13,9 @@ unsigned long _copy_from_user(void *to, const void __user *from, unsigned long n
+ 	might_fault();
+ 	if (!should_fail_usercopy() && likely(access_ok(from, n))) {
+ 		instrument_copy_from_user_before(to, from, n);
++
+ 		res = raw_copy_from_user(to, from, n);
++
+ 		instrument_copy_from_user_after(to, from, n, res);
+ 	}
+ 	if (unlikely(res))
+diff --git a/mm/gup.c b/mm/gup.c
+index fe195d47d..90d3df907 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -554,7 +554,7 @@ static struct page *follow_page_pte(struct vm_area_struct *vma,
+ 		return no_page_table(vma, flags);
+ 
+ 	ptep = pte_offset_map_lock(mm, pmd, address, &ptl);
+-	pte = *ptep;
++	pte = rr_read_pte(ptep);
+ 	if (!pte_present(pte)) {
+ 		swp_entry_t entry;
+ 		/*
+diff --git a/mm/memory.c b/mm/memory.c
+index 8a6d5c823..2c144db86 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -86,6 +86,7 @@
+ #include <linux/uaccess.h>
+ #include <asm/tlb.h>
+ #include <asm/tlbflush.h>
++#include <asm/kernel_rr.h>
+ 
+ #include "pgalloc-track.h"
+ #include "internal.h"
+@@ -945,7 +946,7 @@ copy_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+ {
+ 	struct mm_struct *src_mm = src_vma->vm_mm;
+ 	unsigned long vm_flags = src_vma->vm_flags;
+-	pte_t pte = *src_pte;
++	pte_t pte = rr_read_pte(src_pte);
+ 	struct page *page;
+ 
+ 	page = vm_normal_page(src_vma, addr, pte);
+@@ -1028,6 +1029,7 @@ copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+ 	int rss[NR_MM_COUNTERS];
+ 	swp_entry_t entry = (swp_entry_t){0};
+ 	struct page *prealloc = NULL;
++	pte_t pte_val;
+ 
+ again:
+ 	progress = 0;
+@@ -1056,11 +1058,13 @@ copy_pte_range(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+ 			    spin_needbreak(src_ptl) || spin_needbreak(dst_ptl))
+ 				break;
+ 		}
+-		if (pte_none(*src_pte)) {
++
++		pte_val = rr_read_pte(src_pte);
++		if (pte_none(pte_val)) {
+ 			progress++;
+ 			continue;
+ 		}
+-		if (unlikely(!pte_present(*src_pte))) {
++		if (unlikely(!pte_present(pte_val))) {
+ 			ret = copy_nonpresent_pte(dst_mm, src_mm,
+ 						  dst_pte, src_pte,
+ 						  dst_vma, src_vma,
+@@ -1422,8 +1426,9 @@ static unsigned long zap_pte_range(struct mmu_gather *tlb,
+ 	flush_tlb_batched_pending(mm);
+ 	arch_enter_lazy_mmu_mode();
+ 	do {
+-		pte_t ptent = *pte;
++		pte_t ptent;
+ 		struct page *page;
++		ptent = rr_read_pte(pte);
+ 
+ 		if (pte_none(ptent))
+ 			continue;
+@@ -4930,7 +4935,7 @@ static vm_fault_t handle_pte_fault(struct vm_fault *vmf)
+ 		 * So now it's safe to run pte_offset_map().
+ 		 */
+ 		vmf->pte = pte_offset_map(vmf->pmd, vmf->address);
+-		vmf->orig_pte = *vmf->pte;
++		vmf->orig_pte = rr_read_pte(vmf->pte);
+ 		vmf->flags |= FAULT_FLAG_ORIG_PTE_VALID;
+ 
+ 		/*
+-- 
+2.39.2
+
