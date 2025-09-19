@@ -86,3 +86,6 @@ Follow the instruction [here](bug-repro.md).
 
 ### Record Performance
 Follow the instruction [here](record-perf.md).
+
+## Contribution
+If you would like to participate in the KRR's development, please check out [here](https://github.com/krr-io) for the source code repos of QEMU, KVM and guest Linux kernel, you are very welcome to submit PRs ;).
